@@ -15,7 +15,7 @@ class Graphs:
         result = seasonal_decompose(data, model='additive', freq=1)
         return result
 
-    def tsplot(y, lags=None, figsize=(10, 8), style='bmh'):
+    def tsplot(y, lags=None, figsize=(16,12), style='bmh'):
         if not isinstance(y, pandas.DataFrame):
             y = pandas.DataFrame(y)
         with pyplot.style.context(style):

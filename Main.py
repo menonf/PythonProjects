@@ -22,8 +22,9 @@ adjustedClose.plot(kind='kde')
 pyplot.show()
 print('\n\nResults of Dickey-Fuller Test adjustedClose:')
 print(PyModules.functions.adftest(adjustedClose.iloc[:, 0].values))
+lrets=np.log(adjustedClose).diff(periods=1).dropna()
+#lrets = np.log(adjustedClose/adjustedClose.shift(1)).dropna()  # log returns
 
-lrets = np.log(adjustedClose/adjustedClose.shift(1)).dropna()  # log returns
 PyModules.Graphs.SeasonalPatern(lrets).plot()
 pyplot.show()
 PyModules.Graphs.tsplot(y=lrets, lags=20)
@@ -52,3 +53,7 @@ res = garch11.fit(update_freq=5, disp='off')
 print(res.summary())
 GARCHResiduals = RModules.rfunctions.RGarch(lrets)
 PyModules.Graphs.tsplot(GARCHResiduals, lags=20)
+
+
+#GARCHResiduals = RModules.rfunctions.ARIMAGARCH(lrets)
+#print(GARCHResiduals)
