@@ -48,11 +48,9 @@ print(forecast)
 
 PyModules.Graphs.tsplot(bst_mdl.resid, lags=20)  # residual
 PyModules.Graphs.tsplot(np.square(bst_mdl.resid), lags=20)
-garch11 = arch_model(10*lrets, p=1, o=0, q=1)  # constant mean with normal distribution
+garch11 = arch_model(10*lrets, p=1, o=0, q=1)  # Python GARCH - constant mean with normal distribution
 res = garch11.fit(update_freq=5, disp='off')
 print(res.summary())
-GARCHResiduals = RModules.rfunctions.RGarch(lrets)
+GARCHResiduals = RModules.rfunctions.RGarch(lrets) # R GARCH used for graphing constant mean with normal distribution
 PyModules.Graphs.tsplot(GARCHResiduals, lags=20)
 PyModules.Graphs.tsplot(np.square(GARCHResiduals), lags=20)
-#GARCHResiduals = RModules.rfunctions.ARIMAGARCH(lrets)
-#print(GARCHResiduals)
