@@ -41,9 +41,7 @@ pyplot.xlabel("Time")
 pyplot.ylabel("Price")
 pyplot.show()
 
-
 price_array = simulation_df.iloc[-1, :]
-#price_array = sorted(price_array, key=int)
 x = price_array
 mu = price_array.mean()
 sigma = price_array.std()
@@ -51,7 +49,6 @@ sigma = price_array.std()
 var = numpy.percentile(price_array, 10)
 var1 = numpy.percentile(price_array, 5)
 var2 = numpy.percentile(price_array, 1)
-
 
 q = numpy.percentile(price_array , 1)
 num_bins = 20
@@ -64,8 +61,6 @@ pyplot.title(r'Histogram of Speculated Stock Prices', fontsize=18, fontweight='b
 pyplot.subplots_adjust(left=0.15)
 pyplot.axvline(x=q, linewidth=4, color='r')
 pyplot.show()
-
-
 
 print("VaR at 90% Confidence: " + '${:,.2f}'.format((previousDayPrice * shares).sum()- var))
 print("VaR at 95% Confidence: " + '${:,.2f}'.format((previousDayPrice * shares).sum() - var1))
