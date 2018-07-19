@@ -6,27 +6,28 @@ import scipy.stats
 
 webData = pandas.DataFrame.from_csv("Portfolio.csv", header=0)
 dailyPrices = webData.iloc[:, 0:3]
-weights = numpy.array([30, 40, 10])
+weights = numpy.array([0.375, 0.5, 0.125])
+shares = numpy.array([30, 40, 10])
 
 logReturns = numpy.log(dailyPrices/dailyPrices.shift(1)).dropna()
 portfolioLogReturns = logReturns.sum(axis=1)
 
 previousDayPrice = dailyPrices.tail(1).values
-previousDayPortfolio = list(chain.from_iterable(previousDayPrice * weights))
+previousDayPortfolio = list(chain.from_iterable(previousDayPrice * shares))
 
-PortfolioMean = (logReturns.mean() * previousDayPortfolio).sum()
-portfolioVariance = numpy.matmul(numpy.matmul(logReturns.cov(), previousDayPortfolio), previousDayPortfolio)
+portfolioMean = (logReturns.mean() * weights).sum()
+portfolioVariance = numpy.dot(weights.T, numpy.dot(logReturns.cov(), weights))
 portfolioStdDeviation = numpy.sqrt(portfolioVariance)
 
-tdf, tmean, tsigma = scipy.stats.t.fit(portfolioLogReturns.as_matrix())
-support = numpy.linspace(portfolioLogReturns.min(), portfolioLogReturns.max(), 100)
-portfolioLogReturns.hist(bins=40, normed=True, histtype='stepfilled', alpha=0.5);
-pyplot.plot(support, scipy.stats.t.pdf(support, loc=tmean, scale=tsigma, df=tdf), "r-")
-pyplot.title(u"Daily change in Portfolio(%)", weight='bold');
+print('1 day VaR @ 99% confidence interval =',scipy.stats.norm.ppf(0.01, portfolioMean, portfolioStdDeviation) * numpy.sum(previousDayPortfolio))
+print('1 day VaR @ 95% confidence interval =',scipy.stats.norm.ppf(0.05, portfolioMean, portfolioStdDeviation) * numpy.sum(previousDayPortfolio))
+print('1 day VaR @ 90% confidence interval =',scipy.stats.norm.ppf(0.10, portfolioMean, portfolioStdDeviation) * numpy.sum(previousDayPortfolio))
+
+pyplot.hist(portfolioLogReturns, bins=25)
+xmin, xmax = pyplot.xlim()
+x = numpy.linspace(xmin, xmax, 1000)
+p =scipy.stats.norm.pdf(x, portfolioMean.mean(), portfolioStdDeviation)
+pyplot.plot(x, p, 'k', linewidth=2)
+title = "Plot mu = %.2f,  std = %.2f" % (portfolioMean.mean(), portfolioStdDeviation)
+pyplot.title(title)
 pyplot.show()
-
-#print(['90%', portfolioStdDeviation*1.28], ['95%', portfolioStdDeviation*1.65], ["99%", portfolioStdDeviation*2.33])
-print('VaR @ 99% confidence interval =',scipy.stats.norm.ppf(0.01, PortfolioMean, portfolioStdDeviation))
-print('VaR @ 95% confidence interval =',scipy.stats.norm.ppf(0.05, PortfolioMean, portfolioStdDeviation))
-print('VaR @ 90% confidence interval =',scipy.stats.norm.ppf(0.10, PortfolioMean, portfolioStdDeviation))
-

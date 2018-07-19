@@ -20,5 +20,5 @@ VaR_90 = possiblePortfolio.quantile(0.1)
 VaR_95 = possiblePortfolio.quantile(0.05)
 VaR_99 = possiblePortfolio.quantile(0.01)
 
-pyplot.show()
 print(['90%', VaR_90], ['95%', VaR_95], ["99%", VaR_99])
+pyplot.show()
