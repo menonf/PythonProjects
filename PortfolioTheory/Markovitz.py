@@ -72,4 +72,3 @@ plt.show()
 
 print(max_sharpe_port)
 print(max_sharpe_port[1])
-print(max_sharpe_port[0])

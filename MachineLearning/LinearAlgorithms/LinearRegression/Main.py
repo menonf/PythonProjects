@@ -17,6 +17,7 @@ X = sm.add_constant(X)
 results = sm.OLS(Y, X)
 results = results.fit()
 print('\nUsing Statsmodels')
+print(results.summary())
 print(results.params)
 
 ########################################################################

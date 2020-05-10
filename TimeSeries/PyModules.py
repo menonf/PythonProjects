@@ -1,21 +1,33 @@
 import pandas
-import numpy as np
-from statsmodels.tsa.stattools import adfuller
-from statsmodels.tsa.arima_model import ARIMA
-from statsmodels.tsa.seasonal import seasonal_decompose
-
+import scipy.stats as scs
+import statsmodels.api as sm
 from matplotlib import pyplot
 from statsmodels.graphics import tsaplots
-import statsmodels.api as sm
-import scipy.stats as scs
+from statsmodels.tsa.arima_model import ARIMA
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.seasonal import seasonal_decompose
+from pylab import *
 
 class Graphs:
-    
-    def SeasonalPatern(data):  # time series decompositions jbl pg 108
-        result = seasonal_decompose(data, model='additive', freq=1)
-        return result
 
-    def tsplot(y, lags=None, figsize=(16,12), style='bmh'):
+    def SeasonalPattern(self,data):
+        result = seasonal_decompose(data, model='additive', period=1)
+        with pyplot.style.context(style='bmh'):
+            pyplot.figure(figsize=(16, 14))
+            layout = (2, 2)
+            trend = pyplot.subplot2grid(layout, (0, 0), colspan=2)
+            ses = pyplot.subplot2grid(layout, (1, 0))
+            res = pyplot.subplot2grid(layout, (1, 1))
+            result.trend.plot(ax=trend).set_title('Trend')
+            result.resid.plot(ax=res).set_title('Residuals')
+            result.seasonal.plot(ax=ses).set_title('Seasonality')
+            self.plot_axis(trend)
+            self.plot_axis(ses)
+            self.plot_axis(res)
+            pyplot.show()
+        return None
+
+    def tsplot(self, y, lags=None, figsize=(16, 12), style='bmh'):
         if not isinstance(y, pandas.DataFrame):
             y = pandas.DataFrame(y)
         with pyplot.style.context(style):
@@ -35,33 +47,34 @@ class Graphs:
             qq_ax.set_title('QQ Plot')
             scs.probplot(y.iloc[:, 0].values, sparams=(y.mean(), y.std()), plot=pp_ax)
             pyplot.tight_layout()
+            self.plot_axis(ts_ax)
+            self.plot_axis(acf_ax)
+            self.plot_axis(pacf_ax)
+            self.plot_axis(pp_ax)
+            self.plot_axis(qq_ax)
             pyplot.show()
         return None
 
-    def fcstPlot(forecast, tsdata, n_steps): # Plot 21 day forecast for SPY returns
-        pyplot.style.use('bmh')
-        fig = pyplot.figure(figsize=(9, 7))
-        ax = pyplot.gca()
-        tsdata.plot(ax=ax, label='S&P500 Returns')
-        styles = ['b-', '0.2', '0.75', '0.2', '0.75']
-        forecast.plot(ax=ax, style=styles)
-        pyplot.fill_between(forecast.index, forecast.lower_ci_95, forecast.upper_ci_95, color='gray', alpha=0.7)
-        pyplot.fill_between(forecast.index, forecast.lower_ci_99, forecast.upper_ci_99, color='gray', alpha=0.2)
-        pyplot.title('{} Day S&P500 Return Forecast\nARIMA{}'.format(n_steps, (4, 0, 3)))
-        pyplot.legend(loc='best', fontsize=10)
-        pyplot.show()
+    def plot_axis(self, ts_ax):
+        for axis in ['top', 'bottom', 'left', 'right']:
+            ts_ax.spines[axis].set_linewidth(2)
+        for tick in ts_ax.xaxis.get_major_ticks():
+            tick.label1.set_fontsize(14)
+            tick.label1.set_fontweight('bold')
+        for tick in ts_ax.yaxis.get_major_ticks():
+            tick.label1.set_fontsize(14)
+            tick.label1.set_fontweight('bold')
         return None
 
-
-class functions:
-    def adftest(p_series):# Perform Dickey-Fuller test to test the stationarity: pg 98 jason brown lee
+class Functions:
+    def adftest(p_series):  # Perform Dickey-Fuller test to test the stationarity: pg 98 jason brown lee
         dftest = adfuller(p_series)
-        dfoutput = pandas.Series(dftest[0:4],index=['Test Statistic', 'p-value', '#lags Used', 'Number of Observations Used'])
+        dfoutput = pandas.Series(dftest[0:4], index=['Test Statistic', 'p-value', '#lags Used', 'Number of Observations Used'])
         for key, value in dftest[4].items():
             dfoutput['Critical Value (%s)' % key] = value
         return dfoutput
 
-    def evaluate_models(dataset, p_values, d_values, q_values):# returns ARIMAResults class
+    def evaluate_models(dataset, p_values, d_values, q_values):  # returns ARIMAResults class
         best_aic = float("inf")
         best_order = None
         best_model = None
@@ -71,19 +84,12 @@ class functions:
                     order = (p, d, q)
                     try:
                         model = ARIMA(dataset, order=order)
-                        results = model.fit(method='mle', disp=0)
+                        results = model.fit(method='mle', trend='nc')
                         if results.aic < best_aic:
                             best_aic = results.aic
                             best_order = order
                             best_model = results
-                    except: continue
+                    except:
+                        continue
         print('aic: {:6.5f} | order: {}'.format(best_aic, best_order))
-        return best_model
-
-    def forecast(dataset, n_steps, idx): # Create a n day forecast of SPY returns with 95%, 99% CI
-        f, err95, ci95 = dataset.forecast(steps=n_steps)  # 95% CI
-        _, err99, ci99 = dataset.forecast(steps=n_steps, alpha=0.01)  # 99% CI
-        fc_95 = pandas.DataFrame(np.column_stack([f, ci95]), index=idx, columns=['forecast', 'lower_ci_95', 'upper_ci_95'])
-        fc_99 = pandas.DataFrame(np.column_stack([ci99]), index=idx, columns=['lower_ci_99', 'upper_ci_99'])
-        fc_all = fc_95.combine_first(fc_99)
-        return fc_all
+        return best_aic, best_order, best_model
