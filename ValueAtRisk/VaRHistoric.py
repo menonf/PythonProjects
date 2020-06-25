@@ -3,9 +3,9 @@ import pandas
 from matplotlib import pyplot
 from itertools import chain
 
-webData = pandas.DataFrame.from_csv("Portfolio.csv", header=0)
-dailyPrices = webData.iloc[:, 0:3]
-weights = numpy.array([30, 40, 10])
+webData = pandas.read_csv("Sp500history.csv", header=0)
+dailyPrices = webData.iloc[:, 1:3]
+weights = numpy.array([2000, 500])
 
 logReturns = numpy.log(dailyPrices/dailyPrices.shift(1)).dropna()  # same as Portfolio.pct_change() #Percentage change
 previousDayPrice = dailyPrices.tail(1).values

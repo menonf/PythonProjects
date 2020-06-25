@@ -1,13 +1,27 @@
 import numpy
-import pandas
 from itertools import chain
 from matplotlib import pyplot
 import scipy.stats
+import numpy as np
 
-webData = pandas.DataFrame.from_csv("Portfolio.csv", header=0)
-dailyPrices = webData.iloc[:, 0:3]
-weights = numpy.array([0.375, 0.5, 0.125])
-shares = numpy.array([30, 40, 10])
+from tiingo import TiingoClient
+import datetime
+
+# Tiingo API call to fetch data
+config = {}
+config['session'] = True
+config['api_key'] = "81f0783ae3d1756869af76d72b52a86f08e2ca15"
+
+client = TiingoClient(config)
+stocks = ['MSFT','AAPL', 'AMZN', 'GOOGL', 'FB']
+dailyPrices = client.get_dataframe(stocks,
+                                      frequency='daily',
+                                      metric_name='open',
+                                      startDate=str(datetime.datetime.now().date() - datetime.timedelta(days=366)),
+                                      endDate=str(datetime.datetime.now().date()))
+
+shares = np.array([4, 2, 2, 4, 25])
+weights =  shares/shares.sum()
 
 logReturns = numpy.log(dailyPrices/dailyPrices.shift(1)).dropna()
 portfolioLogReturns = logReturns.sum(axis=1)
