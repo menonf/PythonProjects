@@ -4,6 +4,7 @@ import warnings
 from TimeSeries import PyModules
 from matplotlib import pyplot
 from arch import arch_model
+from scipy import stats
 from TimeSeries.PyModules import Graphs
 
 warnings.filterwarnings("ignore")
@@ -14,7 +15,7 @@ TSPlot = pd.DataFrame(DailyClose).plot()
 plt = Graphs()
 plt.plot_axis(ts_ax=TSPlot)
 
-plt.SeasonalPattern(DailyClose)
+plt.SeasonalPattern(WebData)
 print('\n\nResults of Dickey-Fuller Test on AdjustedClose:')
 print(PyModules.Functions.adftest(DailyClose.values))
 plt.tsplot(y=DailyClose, lags=20)
@@ -22,15 +23,15 @@ plt.tsplot(y=DailyClose, lags=20)
 LogReturns = np.log(DailyClose).diff(periods=1).dropna()
 logrets = LogReturns.plot(kind='kde')
 plt.plot_axis(logrets)
-pyplot.show()
+print(stats.describe(LogReturns))
 
 plt.tsplot(y=LogReturns, lags=20)
 print('\n\nResults of Dickey-Fuller Test LogReturns:')
 print(PyModules.Functions.adftest(LogReturns.values))
 
-PList = [4]   # PList = [0, 1, 2, 3, 4, 5]  Lag order of the symmetric innovation
-DList = [0]   # Difference or Lag order of the asymmetric innovation
-QList = [3]   # QList = [0, 1, 2, 3, 4, 5] Lag order of lagged volatility
+PList = [3]   # PList = [0, 1, 2, 3, 4]  Lag order of the symmetric innovation
+DList = [0]   # Difference or Lag order of the asymmetric innovations
+QList = [2]   # QList = [0, 1, 2, 3, 4] Lag order of lagged volatility
 
 BestARIMAModel = PyModules.Functions.evaluate_models(LogReturns, PList, DList, QList)  # constant variance
 OrderPDQ = BestARIMAModel[1]
@@ -40,7 +41,7 @@ print(ARIMAModelOutput.summary())
 plt.tsplot(ARIMAModelOutput.resid, lags=20)  # residual
 plt.tsplot(np.square(ARIMAModelOutput.resid), lags=20)
 
-GARCHModel = arch_model(ARIMAModelOutput.resid, p=OrderPDQ[0], o=OrderPDQ[1], q=OrderPDQ[2], dist='StudentsT')
+GARCHModel = arch_model(ARIMAModelOutput.resid, p=1, o=OrderPDQ[1], q=1)
 GARCHModelOutput = GARCHModel.fit()
 print(GARCHModelOutput.summary())
 plt.tsplot(GARCHModelOutput.std_resid, lags=20)

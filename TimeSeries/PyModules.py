@@ -14,10 +14,10 @@ class Graphs:
         result = seasonal_decompose(data, model='additive', period=1)
         with pyplot.style.context(style='bmh'):
             pyplot.figure(figsize=(16, 14))
-            layout = (2, 2)
+            layout = (3, 1)
             trend = pyplot.subplot2grid(layout, (0, 0), colspan=2)
             ses = pyplot.subplot2grid(layout, (1, 0))
-            res = pyplot.subplot2grid(layout, (1, 1))
+            res = pyplot.subplot2grid(layout, (2, 0))
             result.trend.plot(ax=trend).set_title('Trend')
             result.resid.plot(ax=res).set_title('Residuals')
             result.seasonal.plot(ax=ses).set_title('Seasonality')
