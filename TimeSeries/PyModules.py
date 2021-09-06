@@ -93,3 +93,4 @@ class Functions:
                         continue
         print('aic: {:6.5f} | order: {}'.format(best_aic, best_order))
         return best_aic, best_order, best_model
+

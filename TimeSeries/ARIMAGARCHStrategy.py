@@ -13,7 +13,7 @@ PList = [0, 1, 2, 3, 4, 5]             # Lag order of the symmetric innovation
 DList = [0]                            # Difference or Lag order of the asymmetric innovation
 QList = [0, 1, 2, 3, 4, 5]             # Lag order of lagged volatility
 
-RollingWindowLength = 10
+RollingWindowLength = 25
 ForecastLength = len(LogReturns) - RollingWindowLength
 Signal = 0 * LogReturns[-ForecastLength:]
 
@@ -23,7 +23,7 @@ for i in range(ForecastLength):
     OrderPDQ = BestARIMAModel[1]
     ModelOutput = BestARIMAModel[2]
 
-    GARCHModel = arch_model(ModelOutput.resid, p=OrderPDQ[0], o=OrderPDQ[1], q=OrderPDQ[2], dist='StudentsT')
+    GARCHModel = arch_model(ModelOutput.resid, p=1, o=OrderPDQ[1], q=1)
     Result = GARCHModel.fit(update_freq=10, disp='off')
     ForecastOutput = Result.forecast(horizon=1, start=None, align='origin')
     Signal.iloc[i] = np.sign(ForecastOutput.mean['h.1'].iloc[-1])
