@@ -6,7 +6,7 @@ import numpy as np
 
 # Import Bank of England spot curve data from excel
 df = pd.read_excel("GLC Nominal month end data_1970 to 2015.xlsx",
-                   index_col=0, header=3, dtypes="float64", sheet_name="4. spot curve", skiprows=[4])
+                   index_col=0, header=3, sheet_name="4. spot curve", skiprows=[4])
 
 df = df.iloc[:, 0:20]                                       # Select all of the data up to 10 years
 df = df.dropna(how="any")                                   # Drop nan values

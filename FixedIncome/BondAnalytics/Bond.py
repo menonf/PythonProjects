@@ -23,7 +23,11 @@ class Bond(object):
     def BondPrice(self, YieldToMaturity):
         coupon_periods = self.time_to_maturity * self.coupon_frequency
         coupon_payments = self.par_value * self.coupon_rate
+
+        # range() function returns a sequence of numbers, starting from 0 by default,
+        # and increments by 1 (by default), and ends at a specified number.
         dt = [(i + 1) / self.coupon_frequency for i in range(int(coupon_periods))]
+
         fair_price = sum([coupon_payments / self.coupon_frequency / (1 + YieldToMaturity / self.coupon_frequency) ** (self.coupon_frequency * t) for t in dt]) + \
                 self.par_value / (1 + YieldToMaturity / self.coupon_frequency) ** (self.coupon_frequency * self.time_to_maturity)
         return fair_price
