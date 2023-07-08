@@ -31,15 +31,4 @@ oil = quandl.get('EIA/PET_RWTC_D', api_key=api_key).squeeze()
 oil.plot(lw=2, title='WTI Crude Oil Price', figsize=(12, 4))
 sns.despine()
 plt.tight_layout()
-
-DATA_STORE = Path('assets.h5')
-
-df = (pd.read_csv('wiki_prices.csv',
-                  parse_dates=['date'],
-                  index_col=['date', 'ticker'],
-                  infer_datetime_format=True)
-      .sort_index())
-
-print(df.info(null_counts=True))
-with pd.HDFStore(DATA_STORE) as store:
-    store.put('quandl/wiki/prices', df)
+plt.show()

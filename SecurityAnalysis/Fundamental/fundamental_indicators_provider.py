@@ -1,4 +1,4 @@
-import FundamentalAnalysis as fa
+import fundamentalanalysis as fa
 
 ticker = "AAPL"
 api_key = "eaa83187bd18f51cf2c84830f00e89ae"

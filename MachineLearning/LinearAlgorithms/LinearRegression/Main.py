@@ -1,15 +1,14 @@
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
-import numdifftools as ndt
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 from sklearn.linear_model import LinearRegression
-from MachineLearning.LinearAlgorithms.LinearRegression import LeastSquares
-from MachineLearning.LinearAlgorithms.LinearRegression import GradientDescent
+import LeastSquares
+import GradientDescent
 
 ########################################################################
-df = pd.read_csv('LifeExpectancy.csv', names=['LifeEx', 'LogIncome'])
+df = pd.read_csv('MachineLearning\LinearAlgorithms\LinearRegression\LifeExpectancy.csv', names=['LifeEx', 'LogIncome'])
 X = df.loc[:, ['LifeEx']]
 Y = df.loc[:, ['LogIncome']]
 
@@ -29,7 +28,7 @@ print(Model.intercept_)
 
 #########################################################################
 print('\nSimple Linear Regression(OLS) Method of Estimation from scratch')
-filename = 'LifeExpectancy.csv'
+filename = 'MachineLearning\LinearAlgorithms\LinearRegression\LifeExpectancy.csv'
 dataset = LeastSquares.load_csv(filename)
 for i in range(len(dataset[0])):
     LeastSquares.str_column_to_float(dataset, i)
@@ -63,14 +62,10 @@ y = np.array(df.loc[:, ['LogIncome']])
 theta_start = np.array([1, 1, 1])
 res = minimize(lik, theta_start, method='Nelder-Mead', options={'disp': True})
 
-Hfun = ndt.Hessian(lik, full_output=True)
-hessian_ndt, info = Hfun(res['x'])
-se = np.sqrt(np.diag(np.linalg.inv(hessian_ndt)))
-results = pd.DataFrame({'parameters': res['x'], 'std err': se})
-results.index = ['Intercept', 'Slope', 'Sigma']
 
 print(results)
 plt.scatter(x, y)
 plt.plot(x, res['x'][0] * x + res['x'][1])
+plt.show()
 
 ###########################################################################

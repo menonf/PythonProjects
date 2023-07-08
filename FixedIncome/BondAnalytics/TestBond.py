@@ -1,4 +1,4 @@
-from FixedIncome.BondAnalytics import Bond as BD
+import Bond as BD
 
 # For Theory - https://www.wallstreetmojo.com/category/risk-management/fixed-income/
 # Validate the results using - http://facweb.plattsburgh.edu/razvan.pascalau/BondForm.php

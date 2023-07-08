@@ -1,9 +1,9 @@
-from FixedIncome.YieldCurve import YieldCurve as YC
+import YieldCurve as YC
 import pandas as pd
 from matplotlib import pyplot
 from scipy.interpolate import splrep, splev
 
-bond_table = pd.read_csv('AppleBonds_101519.csv')
+bond_table = pd.read_csv('E:\Repositories\PythonProjects\FixedIncome\YieldCurve\AppleBonds_101519.csv')
 bond_table = bond_table.drop(['Asset Name', 'Mkt Value'], axis=1)
 
 SC = YC.SpotCurve()
