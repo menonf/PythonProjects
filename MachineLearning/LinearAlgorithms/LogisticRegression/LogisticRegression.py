@@ -4,7 +4,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 
-data = pd.read_csv('ClientDetails.csv', header=0)
+data = pd.read_csv('MachineLearning\LinearAlgorithms\LogisticRegression\ClientDetails.csv', header=0)
 data = data.dropna()
 
 data.drop(data.columns[[0, 3, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19]], axis=1, inplace=True)

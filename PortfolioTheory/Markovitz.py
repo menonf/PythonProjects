@@ -9,9 +9,10 @@ config['session'] = True
 config['api_key'] = "81f0783ae3d1756869af76d72b52a86f08e2ca15"
 
 client = TiingoClient(config)
-stocks = ['MSFT','AAPL', 'AMZN', 'GOOGL', 'FB']
+stocks = ['AAPL', 'GOOGL', 'MSFT', 'AMZN']
 ticker_history = client.get_dataframe(stocks, frequency='daily',
                                       metric_name='adjClose', startDate='2017-05-05', endDate='2019-05-18')
+
 # calculate daily returns
 returns = ticker_history.pct_change()
 

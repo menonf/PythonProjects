@@ -1,5 +1,5 @@
 import numpy
-from ValueAtRisk import StochasticProcesses as SP
+import StochasticProcesses as SP
 from matplotlib import pyplot
 
 n = 1000

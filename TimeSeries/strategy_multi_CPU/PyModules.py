@@ -3,10 +3,11 @@ import scipy.stats as scs
 import statsmodels.api as sm
 from matplotlib import pyplot
 from statsmodels.graphics import tsaplots
-from statsmodels.tsa.arima_model import ARIMA
+import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.seasonal import seasonal_decompose
 from pylab import *
+
 
 class Graphs:
 
@@ -83,13 +84,13 @@ class Functions:
                 for q in q_values:
                     order = (p, d, q)
                     try:
-                        model = ARIMA(dataset, order=order)
-                        results = model.fit(method='mle', trend='nc')
+                        model = sm.tsa.arima.ARIMA(dataset, order=order)
+                        results = model.fit()
                         if results.aic < best_aic:
                             best_aic = results.aic
                             best_order = order
                             best_model = results
-                    except:
+                    except e:
                         continue
         print('aic: {:6.5f} | order: {}'.format(best_aic, best_order))
         return best_aic, best_order, best_model

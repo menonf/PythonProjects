@@ -1,14 +1,13 @@
 import pandas as pd
 import numpy as np
 import warnings
-from TimeSeries import PyModules
-from matplotlib import pyplot
+import PyModules
 from arch import arch_model
 from scipy import stats
-from TimeSeries.PyModules import Graphs
+from PyModules import Graphs
 
 warnings.filterwarnings("ignore")
-WebData = pd.read_csv("SP500Historical.csv", header=0, index_col="Date")
+WebData = pd.read_csv("E:\Repositories\PythonProjects\TimeSeries\SP500LastThreeYears.csv", header=0, index_col="Date")
 DailyClose = WebData['AdjClose']
 TSPlot = pd.DataFrame(DailyClose).plot()
 
@@ -29,9 +28,9 @@ plt.tsplot(y=LogReturns, lags=20)
 print('\n\nResults of Dickey-Fuller Test LogReturns:')
 print(PyModules.Functions.adftest(LogReturns.values))
 
-PList = [3]   # PList = [0, 1, 2, 3, 4]  Lag order of the symmetric innovation
+PList = [0, 1, 2, 3, 4]  # PList = [0, 1, 2, 3, 4]  Lag order of the symmetric innovation
 DList = [0]   # Difference or Lag order of the asymmetric innovations
-QList = [2]   # QList = [0, 1, 2, 3, 4] Lag order of lagged volatility
+QList = [0, 1, 2, 3, 4]   # QList = [0, 1, 2, 3, 4] Lag order of lagged volatility
 
 BestARIMAModel = PyModules.Functions.evaluate_models(LogReturns, PList, DList, QList)  # constant variance
 OrderPDQ = BestARIMAModel[1]

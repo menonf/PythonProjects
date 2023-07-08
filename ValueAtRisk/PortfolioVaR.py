@@ -4,14 +4,15 @@ import pandas as pd
 import yfinance as yf
 from itertools import chain
 from pandas_datareader import data as pdr
-from ValueAtRisk import StochasticProcesses
+import StochasticProcesses
+
 
 yf.pdr_override()
 # prices downloaded from MSCI's RiskMetrics System
 # webData = pd.read_csv("MSCIRiskMetricsPrices.csv", header=0)
 # dailyPrices = webData.iloc[:, 1:6]
 
-dailyPrices = pdr.get_data_yahoo("GOOGL AMZN AAPL FB MSFT", start="2019-06-26", end="2020-06-24")['Close']
+dailyPrices = pdr.get_data_yahoo("GOOGL AMZN AAPL Meta MSFT", start="2019-06-26", end="2020-06-24")['Close']
 quantity = np.array([9, 5, 18, 7, 3])
 weights = quantity / quantity.sum()
 
