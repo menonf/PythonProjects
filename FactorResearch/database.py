@@ -3,7 +3,8 @@
 import datetime
 import re
 import time
-from typing import Optional, Tuple
+from datetime import date
+from typing import List, Optional, Tuple, Type
 from urllib import parse
 
 import keyring
@@ -15,17 +16,22 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 
+# ---------------------------------------------------------------------------
+# ORM Base & Models
+# ---------------------------------------------------------------------------
+
+
 class Base(DeclarativeBase):
     """SQLAlchemy Base Class."""
-
     pass
 
 
 class SecurityMaster(Base):
-    """SQLAlchemy ORM Class maps on to security_master table."""
+    """Maps to dbo.security_master table."""
 
     __tablename__ = "security_master"
     __table_args__ = {"schema": "dbo"}
+
     security_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column()
     name: Mapped[str] = mapped_column()
@@ -49,11 +55,12 @@ class SecurityMaster(Base):
 
 
 class SecurityFundamentals(Base):
-    """SQLAlchemy ORM class mapping to security_fundamentals table."""
+    """Maps to dbo.security_fundamentals table."""
 
     __tablename__ = "security_fundamentals"
     __table_args__ = {"schema": "dbo"}
     __mapper_args__ = {"primary_key": ["security_id", "metric_type", "effective_date", "source_vendor"]}
+
     security_id: Mapped[int] = mapped_column()
     metric_type: Mapped[str] = mapped_column()
     metric_value: Mapped[float] = mapped_column()
@@ -63,10 +70,11 @@ class SecurityFundamentals(Base):
 
 
 class MarketData(Base):
-    """SQLAlchemy ORM Class maps on to market_data table."""
+    """Maps to dbo.market_data table."""
 
     __tablename__ = "market_data"
     __table_args__ = {"schema": "dbo"}
+
     md_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     as_of_date: Mapped[str] = mapped_column()
     security_id: Mapped[int] = mapped_column()
@@ -83,10 +91,11 @@ class MarketData(Base):
 
 
 class Portfolio(Base):
-    """SQLAlchemy ORM Class maps on to portfolio table."""
+    """Maps to dbo.portfolio table."""
 
     __tablename__ = "portfolio"
     __table_args__ = {"schema": "dbo"}
+
     port_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     portfolio_short_name: Mapped[str] = mapped_column()
     portfolio_name: Mapped[str] = mapped_column()
@@ -95,10 +104,11 @@ class Portfolio(Base):
 
 
 class PortfolioHoldings(Base):
-    """SQLAlchemy ORM Class maps on to portfolio_holdings table."""
+    """Maps to dbo.portfolio_holdings table."""
 
     __tablename__ = "portfolio_holdings"
     __table_args__ = {"schema": "dbo"}
+
     ph_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     as_of_date: Mapped[str] = mapped_column()
     port_id: Mapped[int] = mapped_column()
@@ -109,10 +119,11 @@ class PortfolioHoldings(Base):
 
 
 class IndexConstituents(Base):
-    """SQLAlchemy ORM Class for index constituents table."""
+    """Maps to reference.index_constituents table."""
 
     __tablename__ = "index_constituents"
     __table_args__ = {"schema": "reference"}
+
     constituent_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     index_id: Mapped[int] = mapped_column()
     security_id: Mapped[int] = mapped_column()
@@ -122,6 +133,62 @@ class IndexConstituents(Base):
     source_vendor: Mapped[str] = mapped_column()
     upsert_date: Mapped[str] = mapped_column()
     upsert_by: Mapped[str] = mapped_column()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_date(date_str: str, fmt: str = "%Y-%m-%d") -> str:
+    """Parse and reformat a date string."""
+    return datetime.datetime.strptime(date_str, fmt).strftime(fmt)
+
+
+def _execute_with_session(orm_session: Session, operation, *args, **kwargs) -> None:
+    """
+    Execute a database operation with standardised error handling.
+
+    Commits on success, rolls back on failure, and always closes the session.
+    """
+    try:
+        operation(*args, **kwargs)
+        orm_session.commit()
+    except SQLAlchemyError as e:
+        print(f"Database error: {e}")
+        orm_session.rollback()
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        orm_session.rollback()
+    finally:
+        orm_session.close()
+
+
+def _read_table(orm_session: Session, orm_engine: Engine, model: Type[Base]) -> DataFrame:
+    """Fetch all columns from an ORM-mapped table."""
+    query = orm_session.query(*model.__table__.columns)
+    return pd.read_sql_query(query.statement, con=orm_engine)
+
+
+def _bulk_delete_insert(
+    orm_session: Session,
+    model: Type[Base],
+    data_list: List[dict],
+    *filter_criteria,
+) -> None:
+    """Delete matching rows and bulk-insert new records."""
+    orm_session.query(model).filter(*filter_criteria).delete(synchronize_session=False)
+    orm_session.bulk_insert_mappings(model, data_list)  # type: ignore
+
+
+def _camel_to_snake(name: str) -> str:
+    """Convert a CamelCase string to snake_case."""
+    return re.sub("([A-Z])", r"_\1", name).lower().lstrip("_")
+
+
+# ---------------------------------------------------------------------------
+# Connection
+# ---------------------------------------------------------------------------
 
 
 def get_db_connection(
@@ -135,7 +202,7 @@ def get_db_connection(
     Establish a connection to SQL Server with retry logic.
 
     Returns:
-        (engine, connection, connection_string, session): SQLAlchemy engine, raw connection, connection string, and ORM session
+        Tuple of (engine, connection, connection_string, session).
     """
     db = keyring.get_password(service_name, "db")
     db_user = keyring.get_password(service_name, "uid")
@@ -166,79 +233,82 @@ def get_db_connection(
     raise RuntimeError("Database connection failed: maximum retries exceeded")
 
 
+# ---------------------------------------------------------------------------
+# Security Master
+# ---------------------------------------------------------------------------
+
+
 def read_security_master(orm_session: Session, orm_engine: Engine) -> DataFrame:
-    """Fetch all records from security_master table.
-
-    Params:
-        orm_session: SQLAlchemy Session object.
-        orm_engine: SQLAlchemy database engine object.
-
-    Returns:
-        DataFrame containing Security Master table records.
-
-    """
+    """Fetch all records from security_master table."""
     query = orm_session.query(SecurityMaster)
-    df_securityMaster = pd.read_sql_query(query.statement, con=orm_engine)
-
-    return df_securityMaster
+    return pd.read_sql_query(query.statement, con=orm_engine)
 
 
-def write_security_master(equities_df: pd.DataFrame, session: Session) -> None:
-    """Write records to security_master table.
+def write_security_master(equities_df: DataFrame, orm_session: Session) -> None:
+    """Insert records into security_master table."""
+    def _insert(data):
+        orm_session.bulk_insert_mappings(SecurityMaster, data)  # type: ignore
 
-    Params:
-        orm_session: SQLAlchemy Session object.
-        orm_engine: SQLAlchemy database engine object.
-
-    Returns:
-        DataFrame containing security_master table records.
-
-    """
-    try:
-        data_list = equities_df.to_dict(orient="records")
-        session.bulk_insert_mappings(SecurityMaster, data_list)  # type: ignore
-        session.commit()
-    except SQLAlchemyError as e:
-        print(f"An error occurred: {str(e)}")
-        session.rollback()
-    except Exception as e:
-        print(f"An unexpected error occurred: {str(e)}")
-        session.rollback()
-    finally:
-        session.close()
+    _execute_with_session(orm_session, _insert, equities_df.to_dict(orient="records"))
 
 
-def read_portfolio(orm_session: Session, orm_engine: Engine, portfolio_short_names: list[str]) -> DataFrame:
-    """Fetch records from portfolio table.
+# ---------------------------------------------------------------------------
+# Portfolio
+# ---------------------------------------------------------------------------
 
-    Params:
-        orm_session: SQLAlchemy Session object.
-        orm_engine: SQLAlchemy database engine object.
 
-    Returns:
-        DataFrame containing portfolio table records.
-
-    """
+def read_portfolio(
+    orm_session: Session,
+    orm_engine: Engine,
+    portfolio_short_names: List[str],
+) -> DataFrame:
+    """Fetch records from portfolio table filtered by short names."""
     query = orm_session.query(
-        Portfolio.port_id, Portfolio.portfolio_short_name, Portfolio.portfolio_name, Portfolio.portfolio_type
+        Portfolio.port_id,
+        Portfolio.portfolio_short_name,
+        Portfolio.portfolio_name,
+        Portfolio.portfolio_type,
     ).filter(Portfolio.portfolio_short_name.in_(portfolio_short_names))
-    df_portfolio = pd.read_sql_query(query.statement, con=orm_engine)
-    return df_portfolio
+    return pd.read_sql_query(query.statement, con=orm_engine)
 
 
-def read_portfolio_holdings(orm_session: Session, orm_engine: Engine, start_date: str, end_date: str) -> DataFrame:
-    """Fetch records from portfolio_holdings table.
-
-    Params:
-        orm_session: SQLAlchemy Session object.
-        orm_engine: SQLAlchemy database engine object.
-
-    Returns:
-        DataFrame containing portfolio_holdings table records.
-
+def write_portfolio_holdings(df_holdings: DataFrame, orm_session: Session) -> None:
     """
-    start_date = datetime.datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y-%m-%d")
-    end_date = datetime.datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+    Upsert records into portfolio_holdings table.
+
+    Deletes existing records for the same portfolio and date before inserting.
+    """
+    if df_holdings.empty:
+        print("No data to write.")
+        return
+
+    as_of_date = df_holdings["as_of_date"].iloc[0]
+    port_ids = df_holdings["port_id"].unique().tolist()
+
+    df_holdings = df_holdings.copy()
+    df_holdings["upsert_date"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    df_holdings["upsert_by"] = "daily_portfolio_load.py"
+
+    def _upsert(data_list):
+        _bulk_delete_insert(
+            orm_session,
+            PortfolioHoldings,
+            data_list,
+            PortfolioHoldings.as_of_date == as_of_date,
+            PortfolioHoldings.port_id.in_(port_ids),
+        )
+
+    _execute_with_session(orm_session, _upsert, df_holdings.to_dict(orient="records"))
+
+
+def read_portfolio_holdings(
+    orm_session: Session,
+    orm_engine: Engine,
+    start_date: str,
+    end_date: str,
+) -> DataFrame:
+    """Fetch records from portfolio_holdings table within a date range."""
+    start_date, end_date = _parse_date(start_date), _parse_date(end_date)
 
     query = orm_session.query(
         PortfolioHoldings.as_of_date,
@@ -247,316 +317,184 @@ def read_portfolio_holdings(orm_session: Session, orm_engine: Engine, start_date
         PortfolioHoldings.held_shares,
     ).filter(PortfolioHoldings.as_of_date.between(start_date, end_date))
 
-    df_portfolio_holdings = pd.read_sql_query(query.statement, con=orm_engine)
-
-    return df_portfolio_holdings
+    return pd.read_sql_query(query.statement, con=orm_engine)
 
 
-def read_market_data(orm_session: Session, orm_engine: Engine, start_date: str, end_date: str) -> pd.DataFrame:
-    """Fetch records from market_data table.
+# ---------------------------------------------------------------------------
+# Market Data
+# ---------------------------------------------------------------------------
 
-    Params:
-        orm_session: SQLAlchemy Session object.
-        orm_engine: SQLAlchemy database engine object.
-        start_date: Start date as a string in "YYYY-MM-DD" format.
-        end_date: End date as a string in "YYYY-MM-DD" format.
 
-    Returns:
-        DataFrame containing market_data table records.
-    """
-    # Parse input dates to datetime objects
-    start_date = datetime.datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y-%m-%d")
-    end_date = datetime.datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+def read_market_data(
+    orm_session: Session,
+    orm_engine: Engine,
+    start_date: str,
+    end_date: str,
+) -> DataFrame:
+    """Fetch records from market_data table within a date range."""
+    start_date, end_date = _parse_date(start_date), _parse_date(end_date)
 
-    # Query all columns dynamically
-    query = orm_session.query(*MarketData.__table__.columns).filter(MarketData.as_of_date.between(start_date, end_date))
-
-    df_market_data = pd.read_sql_query(query.statement, con=orm_engine)
-
-    return df_market_data
+    query = orm_session.query(*MarketData.__table__.columns).filter(
+        MarketData.as_of_date.between(start_date, end_date)
+    )
+    return pd.read_sql_query(query.statement, con=orm_engine)
 
 
 def write_market_data(market_data: DataFrame, orm_session: Session) -> None:
-    """Write records to market_data table.
-
-    Params:
-        orm_session: SQLAlchemy Session object.
-        orm_engine: SQLAlchemy database engine object.
-
-    Returns:
-        DataFrame containing market_data table records.
-
     """
-    try:
-        data_list = market_data.to_dict(orient="records")
-        as_of_dates = market_data["as_of_date"].unique().tolist()
-        security_ids = market_data["security_id"].unique().tolist()
+    Upsert records into market_data table.
 
-        orm_session.query(MarketData).filter(
+    Deletes existing records for the same security and date before inserting.
+    """
+    as_of_dates = market_data["as_of_date"].unique().tolist()
+    security_ids = market_data["security_id"].unique().tolist()
+
+    def _upsert(data_list):
+        _bulk_delete_insert(
+            orm_session,
+            MarketData,
+            data_list,
             MarketData.as_of_date.in_(as_of_dates),
-            MarketData.security_id.in_(security_ids)
-        ).delete(synchronize_session=False)
-        orm_session.bulk_insert_mappings(MarketData, data_list)  # type: ignore
-        orm_session.commit()
+            MarketData.security_id.in_(security_ids),
+        )
 
-    except SQLAlchemyError as e:
-        print(f"An error occurred: {str(e)}")
-        orm_session.rollback()
-    except Exception as e:
-        print(f"An unexpected error occurred: {str(e)}")
-        orm_session.rollback()
-    finally:
-        orm_session.close()
+    _execute_with_session(orm_session, _upsert, market_data.to_dict(orient="records"))
 
 
-def read_index_constituents(orm_session: Session, orm_engine: Engine, start_date: str, end_date: str) -> pd.DataFrame:
-    """Fetch records from market_data table.
+# ---------------------------------------------------------------------------
+# Index Constituents
+# ---------------------------------------------------------------------------
 
-    Params:
-        orm_session: SQLAlchemy Session object.
-        orm_engine: SQLAlchemy database engine object.
-        start_date: Start date as a string in "YYYY-MM-DD" format.
-        end_date: End date as a string in "YYYY-MM-DD" format.
 
-    Returns:
-        DataFrame containing market_data table records.
-    """
-    # Parse input dates to datetime objects
-    start_date = datetime.datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y-%m-%d")
-    end_date = datetime.datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y-%m-%d")
-
-    # Query all columns dynamically
-    query = orm_session.query(*IndexConstituents.__table__.columns)
-
-    df_index_constituents = pd.read_sql_query(query.statement, con=orm_engine)
-
-    return df_index_constituents
+def read_index_constituents(
+    orm_session: Session,
+    orm_engine: Engine,
+    start_date: str,
+    end_date: str,
+) -> DataFrame:
+    """Fetch all records from index_constituents table."""
+    _parse_date(start_date)  # validate inputs
+    _parse_date(end_date)
+    return _read_table(orm_session, orm_engine, IndexConstituents)
 
 
 def write_index_constituents(index_constituents: DataFrame, orm_session: Session) -> None:
-    """Write records to index_constituents table.
-
-    Params:
-        orm_session: SQLAlchemy Session object.
-        orm_engine: SQLAlchemy database engine object.
-
-    Returns:
-        DataFrame containing market_data table records.
-
     """
-    try:
-        data_list = index_constituents.to_dict(orient="records")
-        index_id = index_constituents["index_id"].unique().tolist()
+    Upsert records into index_constituents table.
 
-        orm_session.query(IndexConstituents).filter(IndexConstituents.index_id.in_(index_id)).delete(synchronize_session=False)
-        orm_session.bulk_insert_mappings(IndexConstituents, data_list)  # type: ignore
-        orm_session.commit()
-
-    except SQLAlchemyError as e:
-        print(f"An error occurred: {str(e)}")
-        orm_session.rollback()
-    except Exception as e:
-        print(f"An unexpected error occurred: {str(e)}")
-        orm_session.rollback()
-    finally:
-        orm_session.close()
-
-
-def read_security_fundamentals(orm_session: Session, orm_engine: Engine, metric_type: Optional[str] = None) -> pd.DataFrame:
-    """Fetch records from security_fundamentals table with optional filtering on metric_type.
-
-    Params:
-        orm_session: SQLAlchemy Session object.
-        orm_engine: SQLAlchemy database engine object.
-        metric_type: Optional string to filter by metric_type. If None, fetch all records.
-
-    Returns:
-        DataFrame containing security_fundamentals table records.
+    Deletes existing records for the same index before inserting.
     """
-    # Build query
+    index_ids = index_constituents["index_id"].unique().tolist()
+
+    def _upsert(data_list):
+        _bulk_delete_insert(
+            orm_session,
+            IndexConstituents,
+            data_list,
+            IndexConstituents.index_id.in_(index_ids),
+        )
+
+    _execute_with_session(orm_session, _upsert, index_constituents.to_dict(orient="records"))
+
+
+# ---------------------------------------------------------------------------
+# Security Fundamentals
+# ---------------------------------------------------------------------------
+
+
+def read_security_fundamentals(
+    orm_session: Session,
+    orm_engine: Engine,
+    metric_type: Optional[str] = None,
+) -> DataFrame:
+    """
+    Fetch records from security_fundamentals table.
+
+    Args:
+        metric_type: If provided, filters by metric_type and renames
+                     metric_value column to the snake_case metric name.
+    """
     query = orm_session.query(*SecurityFundamentals.__table__.columns)
-
-    # Apply filter if metric_type is provided
     if metric_type:
         query = query.filter(SecurityFundamentals.metric_type == metric_type)
 
-    df_security_fundamentals = pd.read_sql_query(query.statement, con=orm_engine)
-    # Rename metric_value column if metric_type is provided
-    if metric_type and "metric_value" in df_security_fundamentals.columns:
-        df_security_fundamentals.rename(
-            columns={"metric_value": re.sub("([A-Z])", r"_\1", metric_type).lower().lstrip("_")}, inplace=True
-        )
+    df = pd.read_sql_query(query.statement, con=orm_engine)
 
-    return df_security_fundamentals
+    if metric_type and "metric_value" in df.columns:
+        df.rename(columns={"metric_value": _camel_to_snake(metric_type)}, inplace=True)
+
+    return df
 
 
-def write_security_fundamentals(fundamental_data: pd.DataFrame, orm_session: Session) -> None:
-    """Write security fundamentals data with intelligent upsert/versioning logic.
+def write_security_fundamentals(fundamental_data: DataFrame, orm_session: Session) -> None:
+    """
+    Write security fundamentals with upsert/versioning logic.
 
-    This function handles three scenarios when writing security fundamentals data:
-
-    1. **New data**: If no existing records exist for the same security_id, metric_type,
-       source_vendor, and effective_date combination, new records are inserted.
-
-    2. **Data update (same count)**: If existing active records are found and the number
-       of new records matches the existing count, the old records are deleted and
-       replaced with the new data (overwrite behavior).
-
-    3. **Data versioning (different count)**: If existing active records are found but
-       the count differs from the new data, existing records are closed by setting
-       their end_date to today, and new records are inserted as the latest version.
+    - **New data**: Inserts records when no existing match is found.
+    - **Same count**: Overwrites existing active records.
+    - **Different count**: Closes existing records (sets end_date) and inserts new ones.
 
     Args:
-        fundamental_data (pd.DataFrame): DataFrame containing security fundamentals data.
-            Must include columns: security_id, metric_type, metric_value, source_vendor,
-            effective_date. May optionally include end_date (will be set to None for new records).
-        orm_session (Session): SQLAlchemy Session object for database operations.
-
-    Returns:
-        None
-
-    Raises:
-        SQLAlchemyError: If database operations fail.
-        Exception: For any other unexpected errors during processing.
-
-    Note:
-        - Function assumes single source_vendor and effective_date per call
-        - Active records are identified by end_date being NULL
-        - Session is closed after operation completion
-    """
-    try:
-        if fundamental_data.empty:
-            print("No fundamental data to insert.")
-            return
-
-        # Get unique combinations from incoming data
-        source_vendor = fundamental_data["source_vendor"].iloc[0]  # Assuming single source per call
-        effective_date = fundamental_data["effective_date"].iloc[0]  # Assuming single date per call
-
-        security_ids = fundamental_data["security_id"].unique().tolist()
-        metric_types = fundamental_data["metric_type"].unique().tolist()
-
-        # Query existing records for this source_vendor, effective_date, and metrics
-        existing_records = (
-            orm_session.query(SecurityFundamentals)
-            .filter(
-                SecurityFundamentals.security_id.in_(security_ids),
-                SecurityFundamentals.metric_type.in_(metric_types),
-                SecurityFundamentals.source_vendor == source_vendor,
-                SecurityFundamentals.effective_date == effective_date,
-                SecurityFundamentals.end_date.is_(None),  # Only active records
-            )
-            .all()
-        )
-
-        # Count existing vs new records
-        existing_count = len(existing_records)
-        new_count = len(fundamental_data)
-
-        if existing_records:
-            if existing_count == new_count:
-                # Same count - overwrite existing records
-                print(f"Record counts match ({existing_count}). Overwriting existing records.")
-
-                # Delete existing records
-                orm_session.execute(
-                    delete(SecurityFundamentals)
-                    .where(SecurityFundamentals.security_id.in_(security_ids))
-                    .where(SecurityFundamentals.metric_type.in_(metric_types))
-                    .where(SecurityFundamentals.source_vendor == source_vendor)
-                    .where(SecurityFundamentals.effective_date == effective_date)
-                    .where(SecurityFundamentals.end_date.is_(None))
-                )
-
-                # Insert new records
-                data_list = fundamental_data.to_dict(orient="records")
-                orm_session.bulk_insert_mappings(SecurityFundamentals, data_list)  # type: ignore
-
-            else:
-                # Different count - version the data
-                print(f"Record counts differ (existing: {existing_count}, new: {new_count}). Versioning data.")
-
-                # Set end_date on existing records (using today's date as end_date)
-                from datetime import date
-
-                today = date.today()
-
-                orm_session.execute(
-                    update(SecurityFundamentals)
-                    .where(SecurityFundamentals.security_id.in_(security_ids))
-                    .where(SecurityFundamentals.metric_type.in_(metric_types))
-                    .where(SecurityFundamentals.source_vendor == source_vendor)
-                    .where(SecurityFundamentals.effective_date == effective_date)
-                    .where(SecurityFundamentals.end_date.is_(None))
-                    .values(end_date=today)
-                )
-
-                # Insert new records with end_date as NULL
-                data_list = fundamental_data.to_dict(orient="records")
-                # Ensure end_date is None for new records
-                for record in data_list:
-                    record["end_date"] = None
-
-                orm_session.bulk_insert_mappings(SecurityFundamentals, data_list)  # type: ignore
-        else:
-            # No existing records - insert new ones
-            print(f"No existing records found. Inserting {new_count} new records.")
-            data_list = fundamental_data.to_dict(orient="records")
-            # Ensure end_date is None for new records
-            for record in data_list:
-                record["end_date"] = None
-
-            orm_session.bulk_insert_mappings(SecurityFundamentals, data_list)  # type: ignore
-
-        orm_session.commit()
-        print("Security fundamentals data successfully written.")
-
-    except SQLAlchemyError as e:
-        print(f"Database error: {e}")
-        orm_session.rollback()
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        orm_session.rollback()
-    finally:
-        orm_session.close()
-
-
-def write_portfolio_holdings(df_holdings: pd.DataFrame, orm_session: Session) -> None:
-    """
-    Write records to portfolio_holdings table.
-
-    Params:
-        df_holdings: DataFrame containing portfolio holdings data.
+        fundamental_data: DataFrame with columns: security_id, metric_type,
+            metric_value, source_vendor, effective_date, and optionally end_date.
         orm_session: SQLAlchemy Session object.
     """
-    try:
-        if df_holdings.empty:
-            print("No data to write.")
-            return
+    if fundamental_data.empty:
+        print("No fundamental data to insert.")
+        return
 
-        as_of_date = df_holdings["as_of_date"].iloc[0]
-        port_ids = df_holdings["port_id"].unique().tolist()
+    source_vendor = fundamental_data["source_vendor"].iloc[0]
+    effective_date = fundamental_data["effective_date"].iloc[0]
+    security_ids = fundamental_data["security_id"].unique().tolist()
+    metric_types = fundamental_data["metric_type"].unique().tolist()
 
-        # Delete existing records for same portfolio and date
-        orm_session.query(PortfolioHoldings).filter(
-            PortfolioHoldings.as_of_date == as_of_date, PortfolioHoldings.port_id.in_(port_ids)
-        ).delete(synchronize_session=False)
+    # Common WHERE filters for active records
+    active_record_filters = [
+        SecurityFundamentals.security_id.in_(security_ids),
+        SecurityFundamentals.metric_type.in_(metric_types),
+        SecurityFundamentals.source_vendor == source_vendor,
+        SecurityFundamentals.effective_date == effective_date,
+        SecurityFundamentals.end_date.is_(None),
+    ]
 
-        df_holdings["upsert_date"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        df_holdings["upsert_by"] = "daily_portfolio_load.py"
+    existing_count = (
+        orm_session.query(SecurityFundamentals).filter(*active_record_filters).count()
+    )
+    new_count = len(fundamental_data)
 
-        data_list = df_holdings.to_dict(orient="records")
-        orm_session.bulk_insert_mappings(PortfolioHoldings, data_list)  # type: ignore
-        orm_session.commit()
+    data_list = fundamental_data.to_dict(orient="records")
+    for record in data_list:
+        record["end_date"] = None
 
-    except SQLAlchemyError as e:
-        print(f"An error occurred: {str(e)}")
-        orm_session.rollback()
-    except Exception as e:
-        print(f"An unexpected error occurred: {str(e)}")
-        orm_session.rollback()
-    finally:
-        orm_session.close()
+    def _write(data_list):
+        if existing_count == 0:
+            print(f"No existing records found. Inserting {new_count} new records.")
+            orm_session.bulk_insert_mappings(SecurityFundamentals, data_list)  # type: ignore
+
+        elif existing_count == new_count:
+            print(f"Record counts match ({existing_count}). Overwriting existing records.")
+            orm_session.execute(
+                delete(SecurityFundamentals).where(*active_record_filters)
+            )
+            orm_session.bulk_insert_mappings(SecurityFundamentals, data_list)  # type: ignore
+
+        else:
+            print(f"Record counts differ (existing: {existing_count}, new: {new_count}). Versioning data.")
+            orm_session.execute(
+                update(SecurityFundamentals)
+                .where(*active_record_filters)
+                .values(end_date=date.today())
+            )
+            orm_session.bulk_insert_mappings(SecurityFundamentals, data_list)  # type: ignore
+
+        print("Security fundamentals data successfully written.")
+
+    _execute_with_session(orm_session, _write, data_list)
+
+
+# ---------------------------------------------------------------------------
+# Composite Queries
+# ---------------------------------------------------------------------------
 
 
 def get_portfolio_market_data(
@@ -564,65 +502,74 @@ def get_portfolio_market_data(
     orm_engine: Engine,
     start_date: str,
     end_date: str,
-    portfolio_short_names: list[str],
+    portfolio_short_names: List[str],
 ) -> DataFrame:
     """
-    Join all the SQLAlchemy Portfolio Data objects to return Portfolio Market Data.
+    Join portfolio, holdings, security master, market data, and fundamentals.
 
-    Params:
+    Args:
         orm_session: SQLAlchemy Session object.
-        orm_engine: SQLAlchemy database engine object.
+        orm_engine: SQLAlchemy Engine object.
+        start_date: Start date string in "YYYY-MM-DD" format.
+        end_date: End date string in "YYYY-MM-DD" format.
+        portfolio_short_names: List of portfolio short names to filter by.
 
     Returns:
-        DataFrame containing Portfolio Market Data.
+        Merged DataFrame containing portfolio market data with fundamentals.
     """
-    # Load individual tables
     df_securities = read_security_master(orm_session, orm_engine)
     df_market_data = read_market_data(orm_session, orm_engine, start_date, end_date)
-    df_portfolio_data = read_portfolio(orm_session, orm_engine, portfolio_short_names)
-    df_portfolio_holdings_data = read_portfolio_holdings(orm_session, orm_engine, start_date, end_date)
-    df_security_fundamentals = read_security_fundamentals(orm_session, orm_engine, "shares_outstanding")
+    df_portfolio = read_portfolio(orm_session, orm_engine, portfolio_short_names)
+    df_holdings = read_portfolio_holdings(orm_session, orm_engine, start_date, end_date)
+    df_fundamentals = read_security_fundamentals(orm_session, orm_engine, "shares_outstanding")
 
-    # Merge base market data
-    df_portfolio_market_data = pd.merge(
-        pd.merge(pd.merge(df_portfolio_data, df_portfolio_holdings_data), df_securities), df_market_data
+    # Merge portfolio → holdings → securities → market data
+    df_portfolio_market_data = (
+        df_portfolio
+        .merge(df_holdings, on="port_id")
+        .merge(df_securities, on="security_id")
+        .merge(df_market_data, on=["security_id", "as_of_date"])
     )
 
-    # Ensure datetime format
-    df_portfolio_market_data["as_of_date"] = pd.to_datetime(df_portfolio_market_data["as_of_date"], errors="coerce")
-    df_security_fundamentals["effective_date"] = pd.to_datetime(df_security_fundamentals["effective_date"], errors="coerce")
+    # Coerce dates and drop invalid rows
+    df_portfolio_market_data["as_of_date"] = pd.to_datetime(
+        df_portfolio_market_data["as_of_date"], errors="coerce"
+    )
+    df_fundamentals["effective_date"] = pd.to_datetime(
+        df_fundamentals["effective_date"], errors="coerce"
+    )
+    df_portfolio_market_data.dropna(subset=["as_of_date"], inplace=True)
+    df_fundamentals.dropna(subset=["effective_date"], inplace=True)
 
-    # Drop rows with missing dates
-    df_portfolio_market_data = df_portfolio_market_data.dropna(subset=["as_of_date"])
-    df_security_fundamentals = df_security_fundamentals.dropna(subset=["effective_date"])
-
-    # Ensure matching dtypes for security_id
+    # Align dtypes for join key
     df_portfolio_market_data["security_id"] = df_portfolio_market_data["security_id"].astype(int)
-    df_security_fundamentals["security_id"] = df_security_fundamentals["security_id"].astype(int)
+    df_fundamentals["security_id"] = df_fundamentals["security_id"].astype(int)
 
-    # Prepare for merge_asof using group-wise merge
+    # Group-wise backward merge_asof to align fundamentals to market dates
     merged_rows = []
+    fundamental_cols = set(df_fundamentals.columns) - set(df_portfolio_market_data.columns)
 
-    for sec_id in df_portfolio_market_data["security_id"].unique():
-        df_left = df_portfolio_market_data[df_portfolio_market_data["security_id"] == sec_id].copy()
+    for sec_id, df_left in df_portfolio_market_data.groupby("security_id"):
         df_left = df_left.sort_values("as_of_date").reset_index(drop=True)
-
-        df_right = df_security_fundamentals[df_security_fundamentals["security_id"] == sec_id].copy()
-        df_right = df_right.sort_values("effective_date").reset_index(drop=True)
+        df_right = df_fundamentals[df_fundamentals["security_id"] == sec_id].sort_values("effective_date").reset_index(drop=True)
 
         if not df_right.empty:
             df_merged = pd.merge_asof(
-                df_left, df_right, by="security_id", left_on="as_of_date", right_on="effective_date", direction="backward"
+                df_left,
+                df_right,
+                by="security_id",
+                left_on="as_of_date",
+                right_on="effective_date",
+                direction="backward",
             )
         else:
-            # Fill with missing columns if fundamental data is absent
-            missing_cols = set(df_security_fundamentals.columns) - set(df_left.columns)
-            for col in missing_cols:
-                df_left[col] = pd.NA
-            df_merged = df_left
+            df_merged = df_left.copy()
+            for col in fundamental_cols:
+                df_merged[col] = pd.NA
 
         merged_rows.append(df_merged)
 
-    df_merged_all = pd.concat([df.dropna(axis=1, how="all") for df in merged_rows if not df.empty], ignore_index=True)
-
-    return df_merged_all
+    return pd.concat(
+        [df.dropna(axis=1, how="all") for df in merged_rows if not df.empty],
+        ignore_index=True,
+    )
