@@ -6,11 +6,19 @@ GICS sector/industry data and additional identifiers, then upserts into the
 two-table security master:
 
     dbo.security_master      – one row per canonical security
-    dbo.security_vendor_xref – one row per vendor × security  (Refinitiv-specific codes)
+    dbo.security_vendor_xref – one row per vendor × security (Refinitiv-specific codes)
 
 Matching cascade (highest → lowest priority):
-    ISIN → CUSIP → FIGI → SEDOL → VALOR → WKN → Common Code
-    → PermID → Ticker+Exchange → Name+Country
+    1. RIC via security_vendor_xref          ← catches ALL previously ingested securities
+    2. ISIN → CUSIP → FIGI → SEDOL
+    3. VALOR → WKN → Common Code → PermID
+    4. Ticker+Exchange → Name+Country        ← fuzzy last-resort
+
+Why RIC is first:
+    RIC is always present in Refinitiv data.  Any security ingested previously
+    already has its RIC stored in security_vendor_xref.vendor_ticker.  Checking
+    the xref table first means a security with no ISIN/CUSIP is still matched
+    on every subsequent run rather than being inserted as a duplicate.
 
 Usage:
     python refinitiv_ingest.py
@@ -24,16 +32,14 @@ import logging
 import math
 import time
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 import refinitiv.data as rd
 import sqlalchemy as sql
 from sqlalchemy.orm import Session
 
-from data_engineering.database import database as database
-
-engine, connection, conn_str, session = database.get_db_connection()
+from data_engineering.database import database
 
 # ===========================================================================
 # Logging
@@ -50,13 +56,13 @@ log = logging.getLogger(__name__)
 # Config
 # ===========================================================================
 
-VENDOR              = "Refinitiv"
-PAGE_SIZE           = 10000   # max rows per search page
-GICS_BATCH_SIZE     = 500     # RICs per get_data call (API limit)
-DB_BATCH_SIZE       = 1000    # rows per DB commit
-RETRY_SLEEP_SEC     = 5       # pause between failed API calls
-MAX_API_RETRIES     = 3
-MAX_UNIVERSE_PAGES  = 3       # for testing, stop after this many pages; set to None for full run
+VENDOR             = "Refinitiv"
+PAGE_SIZE          = 10000   # max rows per search page
+GICS_BATCH_SIZE    = 5000      # RICs per get_data call (API limit)
+DB_BATCH_SIZE      = 1000    # rows per DB commit
+RETRY_SLEEP_SEC    = 5        # pause between failed API calls
+MAX_API_RETRIES    = 3
+MAX_UNIVERSE_PAGES = None     # set to an int (e.g. 3) for test runs; None = full run
 
 # Fields returned by rd.discovery.search
 SEARCH_SELECT = (
@@ -73,23 +79,17 @@ SEARCH_SELECT = (
     "ExchangeCode"
 )
 
-# Additional fields fetched via rd.get_data (keyed on RIC)
-GICS_FIELDS = [
+# Fields fetched via rd.get_data (keyed on RIC)
+ENRICH_FIELDS = [
     "TR.ISIN",
     "TR.GICSSector",
     "TR.GICSIndustry",
     "TR.GICSSubIndustry",
+    "TR.VALOR",       # Swiss Valorennummer
+    "TR.WKN",         # German Wertpapierkennnummer
+    "TR.CommonCode",  # Euroclear / Clearstream Common Code
+    "TR.PermID",      # Refinitiv permanent identifier (open, non-recycled)
 ]
-
-# Extra identifiers fetched alongside GICS to widen the matching cascade
-EXTRA_ID_FIELDS = [
-    "TR.VALOR",          # Swiss Valorennummer
-    "TR.WKN",            # German Wertpapierkennnummer
-    "TR.CommonCode",     # Euroclear / Clearstream Common Code
-    "TR.PermID",         # Refinitiv permanent identifier (open, non-recycled)
-]
-
-ENRICH_FIELDS = GICS_FIELDS + EXTRA_ID_FIELDS
 
 # ===========================================================================
 # Step 1 – Fetch universe from Refinitiv (paginated)
@@ -100,15 +100,15 @@ def fetch_refinitiv_universe() -> pd.DataFrame:
     """
     Page through rd.discovery.search for all equity quotes.
 
-    The API uses `skip` for offset-based pagination; we stop when a page
-    comes back empty or shorter than PAGE_SIZE.
+    Uses `skip` for offset-based pagination and stops when a page is empty
+    or shorter than PAGE_SIZE.
     """
     all_pages: List[pd.DataFrame] = []
     skip = 0
-
-    log.info("Starting Refinitiv universe fetch (page size=%d)...", PAGE_SIZE)
-
     page_count = 0
+
+    log.info("Starting Refinitiv universe fetch (page_size=%d)...", PAGE_SIZE)
+
     while True:
         for attempt in range(1, MAX_API_RETRIES + 1):
             try:
@@ -126,18 +126,18 @@ def fetch_refinitiv_universe() -> pd.DataFrame:
                 time.sleep(RETRY_SLEEP_SEC)
 
         if page is None or page.empty:
-            log.info("Empty page at skip=%d – universe fetch complete.", skip)
+            log.info("Empty page at skip=%d – fetch complete.", skip)
             break
 
         page_count += 1
-        if MAX_UNIVERSE_PAGES and page_count > MAX_UNIVERSE_PAGES:
-            log.info("Reached MAX_UNIVERSE_PAGES=%d; stopping test run.", MAX_UNIVERSE_PAGES)
-            break
-
         all_pages.append(page)
         fetched = len(page)
         skip += fetched
-        log.info("Fetched %d rows (total so far: %d).", fetched, skip)
+        log.info("Page %d: fetched %d rows (running total: %d).", page_count, fetched, skip)
+
+        if MAX_UNIVERSE_PAGES and page_count >= MAX_UNIVERSE_PAGES:
+            log.info("Reached MAX_UNIVERSE_PAGES=%d; stopping test run.", MAX_UNIVERSE_PAGES)
+            break
 
         if fetched < PAGE_SIZE:
             break  # last partial page
@@ -152,18 +152,18 @@ def fetch_refinitiv_universe() -> pd.DataFrame:
 
 
 # ===========================================================================
-# Step 2 – Enrich with GICS data via get_data (batched)
+# Step 2 – Enrich with GICS + extra identifiers (batched)
 # ===========================================================================
 
 
 def fetch_enrichment_data(rics: List[str]) -> pd.DataFrame:
     """
-    Fetch GICS sector/industry fields **and** extra identifiers
-    (VALOR, WKN, Common Code, PermID) for a list of RICs in batches.
+    Fetch GICS sector/industry fields and extra identifiers
+    (VALOR, WKN, CommonCode, PermID) for a list of RICs in batches.
     Returns a DataFrame with a RIC column.
     """
     n_batches = math.ceil(len(rics) / GICS_BATCH_SIZE)
-    log.info("Fetching enrichment data in %d batch(es) of %d...", n_batches, GICS_BATCH_SIZE)
+    log.info("Fetching enrichment data in %d batch(es) of %d RICs...", n_batches, GICS_BATCH_SIZE)
 
     pages: List[pd.DataFrame] = []
 
@@ -188,7 +188,7 @@ def fetch_enrichment_data(rics: List[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=["RIC"] + ENRICH_FIELDS)
 
     enrich_df = pd.concat(pages, ignore_index=True)
-    enrich_df = enrich_df.rename(columns={"Instrument": "RIC"})  # rd.get_data uses "Instrument"
+    enrich_df = enrich_df.rename(columns={"Instrument": "RIC"})
     return enrich_df
 
 
@@ -198,7 +198,7 @@ def fetch_enrichment_data(rics: List[str]) -> pd.DataFrame:
 
 
 def _clean(val) -> Optional[str]:
-    """Return None for blank/null/NaN values, stripped string otherwise."""
+    """Return None for blank/null/NaN/NA, stripped string otherwise."""
     if val is None:
         return None
     s = str(val).strip()
@@ -210,109 +210,130 @@ def build_master_and_xref(
     enrich_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Merge search results with enrichment fields and split into the two target DataFrames:
+    Merge search results with enrichment fields and split into:
 
         master_df – columns matching dbo.security_master (no security_id yet)
         xref_df   – columns matching dbo.security_vendor_xref (no security_id yet)
 
-    Internal join-key columns are prefixed with '_' and stripped before any DB write.
+    Columns prefixed '_' are internal join keys stripped before any DB write.
     """
     now_str     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     script_name = "refinitiv_ingest.py"
 
     merged = universe_df.merge(enrich_df, on="RIC", how="left")
 
-    # Helper: safely pull a column that may or may not exist in 'merged'
     def _col(name: str) -> pd.Series:
+        """Safely pull a column that may not exist after the merge."""
         if name in merged.columns:
             return merged[name].map(_clean)
         return pd.Series([None] * len(merged), dtype=object)
 
     master_df = pd.DataFrame({
-        # --- core identifiers ---
         "name":           _col("IssuerCommonName"),
         "isin":           _col("ISIN"),
         "sedol":          _col("SEDOL"),
         "cusip":          _col("CUSIP"),
-        "figi":           None,                                     # not in Refinitiv search
-        "valor":          _col("VALOR"),                            # Swiss Valorennummer
-        "wkn":            _col("WKN"),                              # German Wertpapierkennnummer
-        "common_code":    _col("Common Code"),                      # Euroclear / Clearstream
-        "perm_id":        _col("PermID"),                           # Refinitiv permanent ID
+        "figi":           None,
+        "valor":          _col("TR.VALOR"),
+        "wkn":            _col("TR.WKN"),
+        "common_code":    _col("TR.CommonCode"),
+        "perm_id":        _col("TR.PermID"),
         "ticker":         _col("TickerSymbol"),
         "exchange_code":  _col("ExchangeCode"),
-        # --- descriptive ---
         "country":        _col("RCSExchangeCountryLeaf"),
         "currency":       _col("RCSCurrencyLeaf"),
-        "sector":         _col("GICS Sector Name"),
-        "industry_group": _col("GICS Industry Name"),
-        "industry":       _col("GICS Sub-Industry Name"),
+        "sector":         _col("TR.GICSSector"),
+        "industry_group": _col("TR.GICSIndustry"),
+        "industry":       _col("TR.GICSSubIndustry"),
         "security_type":  _col("RCSAssetCategoryLeaf"),
         "asset_class":    _col("RCSAssetClass"),
         "is_active":      1,
         "upsert_date":    now_str,
         "upsert_by":      script_name,
-        # --- internal join keys (stripped before DB write) ---
+        # Internal join keys
         "_ric":           merged["RIC"],
         "_isin":          _col("ISIN"),
         "_cusip":         _col("CUSIP"),
         "_sedol":         _col("SEDOL"),
-        "_valor":         _col("VALOR"),
-        "_wkn":           _col("WKN"),
-        "_common_code":   _col("Common Code"),
-        "_perm_id":       _col("PermID"),
-        "_ticker_exch":   (_col("TickerSymbol").fillna("") + "|" + _col("ExchangeCode").fillna("")),
-        "_name_country":  (_col("IssuerCommonName").fillna("") + "|" + _col("RCSExchangeCountryLeaf").fillna("")),
+        "_valor":         _col("TR.VALOR"),
+        "_wkn":           _col("TR.WKN"),
+        "_common_code":   _col("TR.CommonCode"),
+        "_perm_id":       _col("TR.PermID"),
+        "_ticker_exch":   (
+            _col("TickerSymbol").fillna("") + "|" + _col("ExchangeCode").fillna("")
+        ),
+        "_name_country":  (
+            _col("IssuerCommonName").fillna("") + "|" + _col("RCSExchangeCountryLeaf").fillna("")
+        ),
     })
 
     xref_df = pd.DataFrame({
         "vendor":               VENDOR,
-        "vendor_ticker":        merged["RIC"].map(_clean),          # RIC is Refinitiv's instrument code
-        "vendor_exchange_code": merged["ExchangeCode"].map(_clean),
-        "vendor_currency":      merged["RCSCurrencyLeaf"].map(_clean),
-        "loanxid":              None,                               # Aladdin-specific, not applicable here
+        "vendor_ticker":        merged["RIC"].map(_clean),
+        "vendor_exchange_code": _col("ExchangeCode"),
+        "vendor_currency":      _col("RCSCurrencyLeaf"),
+        "loanxid":              None,
         "is_primary":           0,
         "is_active":            1,
         "upsert_date":          now_str,
         "upsert_by":            script_name,
-        "_ric":                 merged["RIC"],                      # internal join key
-        "_isin":                merged["ISIN"].map(_clean),
-        "_cusip":               merged["CUSIP"].map(_clean),
+        "_ric":                 merged["RIC"],
     })
 
     return master_df, xref_df
 
 
 # ===========================================================================
-# Step 4 – Upsert security_master and resolve security_ids
+# Step 4 – Build lookup maps
 # ===========================================================================
 
 
-def _build_lookup_maps(existing: pd.DataFrame) -> dict:
+def _build_lookup_maps(
+    existing_master: pd.DataFrame,
+    existing_xref: pd.DataFrame,
+) -> Dict[str, dict]:
     """
-    Build a dict of {identifier_type: {value: security_id}} from the
-    existing security_master table for fast cascade lookups.
-    """
-    def _simple_map(col: str) -> dict:
-        if col not in existing.columns:
-            return {}
-        return {v: k for k, v in existing.set_index("security_id")[col].dropna().items()}
+    Build {identifier_type: {value: security_id}} lookup dicts from both
+    the security_master and the security_vendor_xref tables.
 
-    maps = {
-        "isin":        _simple_map("isin"),
-        "cusip":       _simple_map("cusip"),
-        "figi":        _simple_map("figi"),
-        "sedol":       _simple_map("sedol"),
-        "valor":       _simple_map("valor"),
-        "wkn":         _simple_map("wkn"),
-        "common_code": _simple_map("common_code"),
-        "perm_id":     _simple_map("perm_id"),
+    The xref RIC map is built first and used first in the cascade — it
+    guarantees that any security previously ingested via Refinitiv is found
+    immediately, regardless of whether it has a standard identifier.
+    """
+    def _simple_map(df: pd.DataFrame, col: str) -> dict:
+        if col not in df.columns:
+            return {}
+        series = df.set_index("security_id")[col].dropna()
+        return {v: k for k, v in series.items()}
+
+    # RIC → security_id via xref (catches all previously-ingested securities)
+    xref_ric_map: dict = {}
+    if not existing_xref.empty:
+        refinitiv_xref = existing_xref[
+            (existing_xref["vendor"] == VENDOR) & existing_xref["vendor_ticker"].notna()
+        ]
+        xref_ric_map = dict(
+            zip(refinitiv_xref["vendor_ticker"], refinitiv_xref["security_id"])
+        )
+    log.info("Xref RIC map: %d existing Refinitiv mappings.", len(xref_ric_map))
+
+    # Standard identifier maps from security_master
+    maps: Dict[str, dict] = {
+        "xref_ric":    xref_ric_map,                          # always-populated fallback
+        "isin":        _simple_map(existing_master, "isin"),
+        "cusip":       _simple_map(existing_master, "cusip"),
+        "figi":        _simple_map(existing_master, "figi"),
+        "sedol":       _simple_map(existing_master, "sedol"),
+        "valor":       _simple_map(existing_master, "valor"),
+        "wkn":         _simple_map(existing_master, "wkn"),
+        "common_code": _simple_map(existing_master, "common_code"),
+        "perm_id":     _simple_map(existing_master, "perm_id"),
     }
 
-    # Composite keys
-    ticker_exch_map: dict = {}
+    # Composite keys: Ticker+Exchange and Name+Country
+    ticker_exch_map:  dict = {}
     name_country_map: dict = {}
-    for _, erow in existing.iterrows():
+    for _, erow in existing_master.iterrows():
         sid = erow["security_id"]
         t = _clean(erow.get("ticker"))
         e = _clean(erow.get("exchange_code"))
@@ -328,27 +349,49 @@ def _build_lookup_maps(existing: pd.DataFrame) -> dict:
     return maps
 
 
-def _cascade_lookup(row: pd.Series, maps: dict) -> Optional[int]:
+def _first(d: dict, *keys) -> Optional[int]:
     """
-    Walk the identifier cascade for a single row and return the first
-    matching security_id, or None.
+    Return the first non-None value from dict d for the given keys.
 
-    Priority (highest → lowest):
-      ISIN → CUSIP → FIGI → SEDOL → VALOR → WKN → Common Code
-      → PermID → Ticker+Exchange → Name+Country
+    Using an explicit loop rather than `or`-chaining avoids the edge case
+    where a valid security_id of 0 would be treated as falsy.
+    """
+    for key in keys:
+        if key is not None:
+            val = d.get(key)
+            if val is not None:
+                return val
+    return None
+
+
+def _cascade_lookup(row: pd.Series, maps: Dict[str, dict]) -> Optional[int]:
+    """
+    Walk the full identifier cascade for a single incoming row.
+
+    Priority:
+      1. RIC (via xref)          – always present; finds all previously ingested securities
+      2. ISIN, CUSIP, FIGI, SEDOL
+      3. VALOR, WKN, CommonCode, PermID
+      4. Ticker+Exchange, Name+Country
     """
     return (
-        maps["isin"].get(row.get("isin") or row.get("_isin"))
-        or maps["cusip"].get(row.get("cusip") or row.get("_cusip"))
-        or maps["figi"].get(row.get("figi"))
-        or maps["sedol"].get(row.get("sedol") or row.get("_sedol"))
-        or maps["valor"].get(row.get("valor") or row.get("_valor"))
-        or maps["wkn"].get(row.get("wkn") or row.get("_wkn"))
-        or maps["common_code"].get(row.get("common_code") or row.get("_common_code"))
-        or maps["perm_id"].get(row.get("perm_id") or row.get("_perm_id"))
-        or maps["ticker_exch"].get(row.get("_ticker_exch"))
-        or maps["name_country"].get(row.get("_name_country"))
+        _first(maps["xref_ric"],    row.get("_ric"))
+        or _first(maps["isin"],     row.get("_isin"))
+        or _first(maps["cusip"],    row.get("_cusip"))
+        or _first(maps["figi"],     row.get("figi"))
+        or _first(maps["sedol"],    row.get("_sedol"))
+        or _first(maps["valor"],    row.get("_valor"))
+        or _first(maps["wkn"],      row.get("_wkn"))
+        or _first(maps["common_code"], row.get("_common_code"))
+        or _first(maps["perm_id"],  row.get("_perm_id"))
+        or _first(maps["ticker_exch"],  row.get("_ticker_exch"))
+        or _first(maps["name_country"], row.get("_name_country"))
     )
+
+
+# ===========================================================================
+# Step 5 – Upsert security_master and resolve security_ids
+# ===========================================================================
 
 
 def upsert_security_master(
@@ -357,20 +400,15 @@ def upsert_security_master(
     orm_engine: sql.Engine,
 ) -> pd.DataFrame:
     """
-    For each incoming security, find an existing security_id by walking
-    the full identifier cascade:
-
-        ISIN → CUSIP → FIGI → SEDOL → VALOR → WKN → Common Code
-        → PermID → Ticker+Exchange → Name+Country
-
-    - Matched  : keep existing security_id.
-    - Unmatched : insert new row; reload the table to capture the generated id.
-
-    Returns master_df with a populated `security_id` column.
+    Resolve each incoming row to an existing security_id via the cascade,
+    insert genuinely new securities, then return master_df with security_id
+    fully populated.
     """
-    log.info("Loading existing security_master from DB...")
-    existing = database.read_security_master(orm_session, orm_engine)
-    maps = _build_lookup_maps(existing)
+    log.info("Loading existing security_master and vendor xref from DB...")
+    existing_master = database.read_security_master(orm_session, orm_engine)
+    existing_xref   = database.read_security_vendor_xref(orm_session, orm_engine, vendor=VENDOR)
+
+    maps = _build_lookup_maps(existing_master, existing_xref)
 
     to_insert:    List[dict]          = []
     security_ids: List[Optional[int]] = []
@@ -381,11 +419,15 @@ def upsert_security_master(
         if sid is None:
             to_insert.append({
                 k: v for k, v in row.items()
-                if not k.startswith("_")  # strip internal join-key columns
+                if not k.startswith("_")
             })
 
     master_df = master_df.copy()
     master_df["security_id"] = security_ids
+
+    matched   = sum(1 for s in security_ids if s is not None)
+    unmatched = len(security_ids) - matched
+    log.info("Cascade results: %d matched, %d new (to insert).", matched, unmatched)
 
     if to_insert:
         log.info("Inserting %d new securities into security_master...", len(to_insert))
@@ -399,10 +441,11 @@ def upsert_security_master(
             )
             log.info("  Inserted batch %d–%d.", i + 1, i + len(batch))
 
-        # Reload to pick up DB-generated security_ids for newly inserted rows
-        log.info("Reloading security_master to resolve new security_ids...")
-        existing = database.read_security_master(orm_session, orm_engine)
-        maps = _build_lookup_maps(existing)
+        # Reload both tables to pick up newly generated security_ids
+        log.info("Reloading tables to resolve new security_ids...")
+        existing_master = database.read_security_master(orm_session, orm_engine)
+        existing_xref   = database.read_security_vendor_xref(orm_session, orm_engine, vendor=VENDOR)
+        maps = _build_lookup_maps(existing_master, existing_xref)
 
         for idx, row in master_df.iterrows():
             if pd.isna(master_df.at[idx, "security_id"]):
@@ -412,7 +455,11 @@ def upsert_security_master(
 
     missing = master_df["security_id"].isna().sum()
     if missing:
-        log.warning("%d rows could not be resolved to a security_id and will be skipped.", missing)
+        log.warning(
+            "%d rows could not be resolved to a security_id and will be skipped. "
+            "These have no identifiers whatsoever — check source data quality.",
+            missing,
+        )
 
     master_df = master_df.dropna(subset=["security_id"])
     master_df["security_id"] = master_df["security_id"].astype(int)
@@ -420,7 +467,7 @@ def upsert_security_master(
 
 
 # ===========================================================================
-# Step 5 – Attach resolved security_ids to xref and write
+# Step 6 – Attach resolved security_ids to xref and write
 # ===========================================================================
 
 
@@ -430,8 +477,8 @@ def upsert_vendor_xref(
     orm_engine: sql.Engine,
 ) -> None:
     """
-    Join the resolved security_ids from master_df into xref_df (keyed on _ric),
-    then batch-upsert into security_vendor_xref via db.write_security_vendor_xref.
+    Join resolved security_ids into xref_df (keyed on _ric), then
+    batch-upsert into security_vendor_xref.
     """
     id_map  = master_df.set_index("_ric")["security_id"].to_dict()
     xref_df = xref_df.copy()
@@ -439,7 +486,6 @@ def upsert_vendor_xref(
     xref_df = xref_df.dropna(subset=["security_id"])
     xref_df["security_id"] = xref_df["security_id"].astype(int)
 
-    # Strip internal join-key columns before writing
     xref_clean = xref_df.drop(columns=[c for c in xref_df.columns if c.startswith("_")])
 
     log.info("Writing %d vendor xref rows...", len(xref_clean))
@@ -460,7 +506,6 @@ def main() -> None:
     log.info("Refinitiv Security Master Ingestion – START")
     log.info("=" * 60)
 
-    # --- Open Refinitiv session ---
     rd.open_session()
     log.info("Refinitiv session opened.")
 
@@ -469,17 +514,22 @@ def main() -> None:
         rics               = universe_df["RIC"].dropna().unique().tolist()
         enrich_df          = fetch_enrichment_data(rics)
         master_df, xref_df = build_master_and_xref(universe_df, enrich_df)
-        log.info("Built %d candidate master rows and %d xref rows.", len(master_df), len(xref_df))
+        log.info(
+            "Built %d candidate master rows and %d xref rows.",
+            len(master_df), len(xref_df),
+        )
     finally:
         rd.close_session()
         log.info("Refinitiv session closed.")
 
-    # --- Open DB connection ---
     orm_engine, orm_conn, _, orm_session = database.get_db_connection()
 
     try:
         master_df = upsert_security_master(master_df, orm_session, orm_engine)
-        log.info("security_master upsert complete. Resolved %d security_ids.", len(master_df))
+        log.info(
+            "security_master upsert complete. Resolved %d security_ids.",
+            len(master_df),
+        )
 
         upsert_vendor_xref(master_df, xref_df, orm_engine)
         log.info("security_vendor_xref upsert complete.")
