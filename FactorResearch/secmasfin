@@ -1,0 +1,461 @@
+"""
+FinanceDatabase Security Master Ingestion
+==========================================
+Fetches equity, ETF, and fund universes from the open-source FinanceDatabase
+package (https://github.com/JerBouma/FinanceDatabase), then upserts into the
+two-table security master:
+
+    dbo.security_master      – one row per canonical security
+    dbo.security_vendor_xref – one row per vendor × security  (FinanceDatabase-specific codes)
+
+Matching cascade (highest → lowest priority):
+    ISIN → CUSIP → FIGI → SEDOL → Composite FIGI → ShareClass FIGI
+    → Ticker+Exchange → Name+Country
+
+The FinanceDatabase provides: symbol (ticker), name, currency, sector,
+industry_group, industry, exchange, market, country, ISIN, CUSIP, FIGI,
+composite_figi, and shareclass_figi.
+
+Usage:
+    python secmaster_financedb.py                   # ingest all asset classes
+    python secmaster_financedb.py --asset equities  # ingest equities only
+    python secmaster_financedb.py                   # ingest all (equities + ETFs + funds)
+    python secmaster_financedb.py --asset equities  # equities only
+    python secmaster_financedb.py --asset etfs      # ETFs only
+    python secmaster_financedb.py --asset funds     # funds only
+
+"""
+
+# ===========================================================================
+# Imports
+# ===========================================================================
+
+import argparse
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional
+
+import financedatabase as fd
+import pandas as pd
+import sqlalchemy as sql
+from sqlalchemy.orm import Session
+
+from data_engineering.database import database as database
+
+# ===========================================================================
+# Logging
+# ===========================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ===========================================================================
+# Config
+# ===========================================================================
+
+VENDOR        = "FinanceDatabase"
+DB_BATCH_SIZE = 1000          # rows per DB commit
+SCRIPT_NAME   = "secmaster_financedb.py"
+
+# Asset classes to ingest (maps CLI name → FinanceDatabase class)
+ASSET_CLASSES: Dict[str, type] = {
+    "equities": fd.Equities,
+    "etfs":     fd.ETFs,
+    "funds":    fd.Funds,
+}
+
+
+# ===========================================================================
+# Helpers (shared with secmaster.py)
+# ===========================================================================
+
+
+def _clean(val) -> Optional[str]:
+    """Return None for blank/null/NaN values, stripped string otherwise."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    return None if s in ("", "nan", "None", "<NA>", "NaN") else s
+
+
+def _safe_col(df: pd.DataFrame, name: str) -> pd.Series:
+    """Safely extract a column, returning all-None series if missing."""
+    if name in df.columns:
+        return df[name].map(_clean)
+    return pd.Series([None] * len(df), dtype=object)
+
+
+# ===========================================================================
+# Step 1 – Fetch universe from FinanceDatabase
+# ===========================================================================
+
+
+def fetch_universe(asset_classes: List[str]) -> pd.DataFrame:
+    """
+    Load selected asset classes from FinanceDatabase and concatenate
+    into a single DataFrame.  The 'symbol' column (original index) is
+    used as the primary key for de-duplication.
+
+    Available columns vary by asset class; missing columns are filled
+    with NaN automatically by pd.concat.
+    """
+    frames: List[pd.DataFrame] = []
+
+    for name in asset_classes:
+        cls = ASSET_CLASSES[name]
+        log.info("Loading %s from FinanceDatabase...", name)
+        obj = cls()
+        df = obj.select()
+
+        # The index is the ticker symbol – promote to a regular column
+        if df.index.name == "symbol" or df.index.name is None:
+            df = df.reset_index()
+            if "index" in df.columns:
+                df = df.rename(columns={"index": "symbol"})
+
+        df["_asset_class"] = name           # tag source for later reference
+        frames.append(df)
+        log.info("  %s: %d rows loaded.", name, len(df))
+
+    universe = pd.concat(frames, ignore_index=True)
+    universe = universe.drop_duplicates(subset=["symbol"])
+    log.info("Combined universe: %d unique symbols after de-duplication.", len(universe))
+    return universe
+
+
+# ===========================================================================
+# Step 2 – Build master & xref DataFrames
+# ===========================================================================
+
+
+def build_master_and_xref(
+    universe_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Map FinanceDatabase columns into the security_master and
+    security_vendor_xref schemas.
+
+    FinanceDatabase columns (equities):
+        symbol, name, currency, sector, industry_group, industry,
+        exchange, market, country, state, city, zipcode, website,
+        market_cap, isin, cusip, figi, composite_figi, shareclass_figi
+
+    ETFs/Funds have slightly different columns (category_group, category,
+    family) but we map them into the same schema where possible.
+    """
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── Convenience aliases ──
+    _c = lambda col: _safe_col(universe_df, col)
+
+    # Map ETF/Fund category fields into sector/industry when the equity
+    # fields are missing
+    sector = _c("sector")
+    industry_group = _c("industry_group")
+    industry = _c("industry")
+
+    # For ETFs / Funds the relevant columns are category_group / category
+    if "category_group" in universe_df.columns:
+        sector = sector.combine_first(_c("category_group"))
+    if "category" in universe_df.columns:
+        industry = industry.combine_first(_c("category"))
+
+    master_df = pd.DataFrame({
+        # --- core identifiers ---
+        "name":           _c("name"),
+        "isin":           _c("isin"),
+        "sedol":          None,                                     # not in FinanceDatabase
+        "cusip":          _c("cusip"),
+        "figi":           _c("figi"),
+        "valor":          None,                                     # not in FinanceDatabase
+        "wkn":            None,                                     # not in FinanceDatabase
+        "common_code":    None,                                     # not in FinanceDatabase
+        "perm_id":        None,                                     # not in FinanceDatabase
+        "composite_figi": _c("composite_figi"),
+        "shareclass_figi": _c("shareclass_figi"),
+        "ticker":         _c("symbol"),
+        "exchange_code":  _c("exchange"),
+        # --- descriptive ---
+        "country":        _c("country"),
+        "currency":       _c("currency"),
+        "sector":         sector,
+        "industry_group": industry_group,
+        "industry":       industry,
+        "security_type":  _c("_asset_class"),                       # equities / etfs / funds
+        "asset_class":    _c("_asset_class"),
+        "market":         _c("market"),
+        "market_cap":     _c("market_cap"),
+        "is_active":      1,
+        "upsert_date":    now_str,
+        "upsert_by":      SCRIPT_NAME,
+        # --- internal join keys (stripped before DB write) ---
+        "_symbol":        _c("symbol"),
+        "_isin":          _c("isin"),
+        "_cusip":         _c("cusip"),
+        "_figi":          _c("figi"),
+        "_composite_figi": _c("composite_figi"),
+        "_shareclass_figi": _c("shareclass_figi"),
+        "_ticker_exch":   (_c("symbol").fillna("") + "|" + _c("exchange").fillna("")),
+        "_name_country":  (_c("name").fillna("") + "|" + _c("country").fillna("")),
+    })
+
+    xref_df = pd.DataFrame({
+        "vendor":               VENDOR,
+        "vendor_ticker":        _c("symbol"),
+        "vendor_exchange_code": _c("exchange"),
+        "vendor_currency":      _c("currency"),
+        "loanxid":              None,
+        "is_primary":           0,
+        "is_active":            1,
+        "upsert_date":          now_str,
+        "upsert_by":            SCRIPT_NAME,
+        "_symbol":              _c("symbol"),               # internal join key
+        "_isin":                _c("isin"),
+        "_cusip":               _c("cusip"),
+    })
+
+    return master_df, xref_df
+
+
+# ===========================================================================
+# Step 3 – Identifier cascade matching
+# ===========================================================================
+
+
+def _build_lookup_maps(existing: pd.DataFrame) -> dict:
+    """
+    Build {identifier_type: {value: security_id}} from the existing
+    security_master table for fast cascade lookups.
+    """
+    def _simple_map(col: str) -> dict:
+        if col not in existing.columns:
+            return {}
+        return {v: k for k, v in existing.set_index("security_id")[col].dropna().items()}
+
+    maps = {
+        "isin":            _simple_map("isin"),
+        "cusip":           _simple_map("cusip"),
+        "figi":            _simple_map("figi"),
+        "sedol":           _simple_map("sedol"),
+        "composite_figi":  _simple_map("composite_figi"),
+        "shareclass_figi": _simple_map("shareclass_figi"),
+    }
+
+    # Composite keys
+    ticker_exch_map:  dict = {}
+    name_country_map: dict = {}
+    for _, erow in existing.iterrows():
+        sid = erow["security_id"]
+        t = _clean(erow.get("ticker"))
+        e = _clean(erow.get("exchange_code"))
+        if t and e:
+            ticker_exch_map[f"{t}|{e}"] = sid
+        n = _clean(erow.get("name"))
+        c = _clean(erow.get("country"))
+        if n and c:
+            name_country_map[f"{n}|{c}"] = sid
+
+    maps["ticker_exch"]  = ticker_exch_map
+    maps["name_country"] = name_country_map
+    return maps
+
+
+def _cascade_lookup(row: pd.Series, maps: dict) -> Optional[int]:
+    """
+    Walk the identifier cascade for a single row and return the first
+    matching security_id, or None.
+
+    Priority (highest → lowest):
+      ISIN → CUSIP → FIGI → SEDOL → Composite FIGI → ShareClass FIGI
+      → Ticker+Exchange → Name+Country
+    """
+    return (
+        maps["isin"].get(row.get("isin") or row.get("_isin"))
+        or maps["cusip"].get(row.get("cusip") or row.get("_cusip"))
+        or maps["figi"].get(row.get("figi") or row.get("_figi"))
+        or maps["sedol"].get(row.get("sedol"))
+        or maps["composite_figi"].get(row.get("composite_figi") or row.get("_composite_figi"))
+        or maps["shareclass_figi"].get(row.get("shareclass_figi") or row.get("_shareclass_figi"))
+        or maps["ticker_exch"].get(row.get("_ticker_exch"))
+        or maps["name_country"].get(row.get("_name_country"))
+    )
+
+
+# ===========================================================================
+# Step 4 – Upsert security_master and resolve security_ids
+# ===========================================================================
+
+
+def upsert_security_master(
+    master_df: pd.DataFrame,
+    orm_session: Session,
+    orm_engine: sql.Engine,
+) -> pd.DataFrame:
+    """
+    For each incoming security, find an existing security_id by walking
+    the identifier cascade.
+
+    - Matched  : keep existing security_id.
+    - Unmatched: insert new row; reload the table to capture the generated id.
+
+    Returns master_df with a populated `security_id` column.
+    """
+    log.info("Loading existing security_master from DB...")
+    existing = database.read_security_master(orm_session, orm_engine)
+    maps = _build_lookup_maps(existing)
+
+    to_insert:    List[dict]          = []
+    security_ids: List[Optional[int]] = []
+
+    for _, row in master_df.iterrows():
+        sid = _cascade_lookup(row, maps)
+        security_ids.append(sid)
+        if sid is None:
+            to_insert.append({
+                k: v for k, v in row.items()
+                if not k.startswith("_")        # strip internal join-key columns
+            })
+
+    master_df = master_df.copy()
+    master_df["security_id"] = security_ids
+
+    if to_insert:
+        log.info("Inserting %d new securities into security_master...", len(to_insert))
+        for i in range(0, len(to_insert), DB_BATCH_SIZE):
+            batch       = to_insert[i : i + DB_BATCH_SIZE]
+            new_session = Session(orm_engine)
+            database._execute_with_session(
+                new_session,
+                lambda data: new_session.bulk_insert_mappings(
+                    database.SecurityMaster, data
+                ),
+                batch,
+            )
+            log.info("  Inserted batch %d–%d.", i + 1, i + len(batch))
+
+        # Reload to pick up DB-generated security_ids for newly inserted rows
+        log.info("Reloading security_master to resolve new security_ids...")
+        existing = database.read_security_master(orm_session, orm_engine)
+        maps = _build_lookup_maps(existing)
+
+        for idx, row in master_df.iterrows():
+            if pd.isna(master_df.at[idx, "security_id"]):
+                master_df.at[idx, "security_id"] = _cascade_lookup(row, maps)
+    else:
+        log.info("All %d securities already exist in security_master.", len(master_df))
+
+    missing = master_df["security_id"].isna().sum()
+    if missing:
+        log.warning(
+            "%d rows could not be resolved to a security_id and will be skipped.",
+            missing,
+        )
+
+    master_df = master_df.dropna(subset=["security_id"])
+    master_df["security_id"] = master_df["security_id"].astype(int)
+    return master_df
+
+
+# ===========================================================================
+# Step 5 – Attach resolved security_ids to xref and write
+# ===========================================================================
+
+
+def upsert_vendor_xref(
+    master_df: pd.DataFrame,
+    xref_df: pd.DataFrame,
+    orm_engine: sql.Engine,
+) -> None:
+    """
+    Join the resolved security_ids from master_df into xref_df
+    (keyed on _symbol), then batch-upsert into security_vendor_xref.
+    """
+    id_map  = master_df.set_index("_symbol")["security_id"].to_dict()
+    xref_df = xref_df.copy()
+    xref_df["security_id"] = xref_df["_symbol"].map(id_map)
+    xref_df = xref_df.dropna(subset=["security_id"])
+    xref_df["security_id"] = xref_df["security_id"].astype(int)
+
+    # Strip internal join-key columns before writing
+    xref_clean = xref_df.drop(columns=[c for c in xref_df.columns if c.startswith("_")])
+
+    log.info("Writing %d vendor xref rows...", len(xref_clean))
+    for i in range(0, len(xref_clean), DB_BATCH_SIZE):
+        batch_df     = xref_clean.iloc[i : i + DB_BATCH_SIZE]
+        xref_session = Session(orm_engine)
+        database.write_security_vendor_xref(batch_df, xref_session, vendor=VENDOR)
+        log.info("  Xref batch %d–%d written.", i + 1, i + len(batch_df))
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Ingest securities from FinanceDatabase into security_master.",
+    )
+    parser.add_argument(
+        "--asset",
+        choices=list(ASSET_CLASSES.keys()) + ["all"],
+        default="all",
+        help="Which asset class to ingest (default: all).",
+    )
+    return parser.parse_args()
+
+
+# ===========================================================================
+# Main
+# ===========================================================================
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.asset == "all":
+        asset_classes = list(ASSET_CLASSES.keys())
+    else:
+        asset_classes = [args.asset]
+
+    log.info("=" * 60)
+    log.info("FinanceDatabase Security Master Ingestion – START")
+    log.info("Asset classes: %s", ", ".join(asset_classes))
+    log.info("=" * 60)
+
+    # --- Fetch from FinanceDatabase (no API key needed, fully open) ---
+    universe_df = fetch_universe(asset_classes)
+    master_df, xref_df = build_master_and_xref(universe_df)
+    log.info(
+        "Built %d candidate master rows and %d xref rows.",
+        len(master_df),
+        len(xref_df),
+    )
+
+    # --- Open DB connection ---
+    orm_engine, orm_conn, _, orm_session = database.get_db_connection()
+
+    try:
+        master_df = upsert_security_master(master_df, orm_session, orm_engine)
+        log.info(
+            "security_master upsert complete. Resolved %d security_ids.",
+            len(master_df),
+        )
+
+        upsert_vendor_xref(master_df, xref_df, orm_engine)
+        log.info("security_vendor_xref upsert complete.")
+    finally:
+        orm_conn.close()
+        log.info("DB connection closed.")
+
+    log.info("=" * 60)
+    log.info("FinanceDatabase Security Master Ingestion – DONE")
+    log.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
