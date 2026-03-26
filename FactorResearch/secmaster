@@ -1,0 +1,404 @@
+"""
+Refinitiv Security Master Ingestion
+=====================================
+Fetches the full equity universe from Refinitiv Data Library, enriches it with
+GICS sector/industry data, then upserts into the two-table security master:
+
+    dbo.security_master      – one row per canonical security (de-duplicated on ISIN/CUSIP/FIGI)
+    dbo.security_vendor_xref – one row per vendor × security  (Refinitiv-specific codes)
+
+Usage:
+    python refinitiv_ingest.py
+"""
+
+# ===========================================================================
+# Imports
+# ===========================================================================
+
+import logging
+import math
+import time
+from datetime import datetime
+from typing import List, Optional
+
+import pandas as pd
+import refinitiv.data as rd
+import sqlalchemy as sql
+from sqlalchemy.orm import Session
+
+from data_engineering.database import database as database
+
+engine, connection, conn_str, session = database.get_db_connection()
+
+# ===========================================================================
+# Logging
+# ===========================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ===========================================================================
+# Config
+# ===========================================================================
+
+VENDOR              = "Refinitiv"
+PAGE_SIZE           = 10000   # max rows per search page
+GICS_BATCH_SIZE     = 500     # RICs per get_data call (API limit)
+DB_BATCH_SIZE       = 1000    # rows per DB commit
+RETRY_SLEEP_SEC     = 5       # pause between failed API calls
+MAX_API_RETRIES     = 3
+MAX_UNIVERSE_PAGES  = 3       # for testing, stop after this many pages; set to None for full run
+
+# Fields returned by rd.discovery.search
+SEARCH_SELECT = (
+    "TickerSymbol, "
+    "IssuerCommonName, "
+    "SEDOL, "
+    "CUSIP, "
+    "RIC, "
+    "ISIN, "
+    "RCSExchangeCountryLeaf, "
+    "RCSCurrencyLeaf, "
+    "RCSAssetCategoryLeaf, "
+    "RCSAssetClass, "
+    "ExchangeCode"
+)
+
+# Additional fields fetched via rd.get_data (keyed on RIC)
+GICS_FIELDS = [
+    "TR.ISIN",
+    "TR.GICSSector",
+    "TR.GICSIndustry",
+    "TR.GICSSubIndustry",
+]
+
+# ===========================================================================
+# Step 1 – Fetch universe from Refinitiv (paginated)
+# ===========================================================================
+
+
+def fetch_refinitiv_universe() -> pd.DataFrame:
+    """
+    Page through rd.discovery.search for all equity quotes.
+
+    The API uses `skip` for offset-based pagination; we stop when a page
+    comes back empty or shorter than PAGE_SIZE.
+    """
+    all_pages: List[pd.DataFrame] = []
+    skip = 0
+
+    log.info("Starting Refinitiv universe fetch (page size=%d)...", PAGE_SIZE)
+
+    page_count = 0
+    while True:
+        for attempt in range(1, MAX_API_RETRIES + 1):
+            try:
+                page = rd.discovery.search(
+                    view=rd.discovery.Views.EQUITY_QUOTES,
+                    filter="AssetType eq 'equity'",
+                    select=SEARCH_SELECT,
+                    top=PAGE_SIZE,
+                )
+                break
+            except Exception as exc:
+                log.warning("Search attempt %d failed: %s", attempt, exc)
+                if attempt == MAX_API_RETRIES:
+                    raise
+                time.sleep(RETRY_SLEEP_SEC)
+
+        if page is None or page.empty:
+            log.info("Empty page at skip=%d – universe fetch complete.", skip)
+            break
+
+        page_count += 1
+        if MAX_UNIVERSE_PAGES and page_count > MAX_UNIVERSE_PAGES:
+            log.info("Reached MAX_UNIVERSE_PAGES=%d; stopping test run.", MAX_UNIVERSE_PAGES)
+            break
+
+        all_pages.append(page)
+        fetched = len(page)
+        skip += fetched
+        log.info("Fetched %d rows (total so far: %d).", fetched, skip)
+
+        if fetched < PAGE_SIZE:
+            break  # last partial page
+
+    if not all_pages:
+        raise RuntimeError("Refinitiv search returned no data.")
+
+    df = pd.concat(all_pages, ignore_index=True)
+    df = df.drop_duplicates(subset=["RIC"])
+    log.info("Universe: %d unique RICs after de-duplication.", len(df))
+    return df
+
+
+# ===========================================================================
+# Step 2 – Enrich with GICS data via get_data (batched)
+# ===========================================================================
+
+
+def fetch_gics_data(rics: List[str]) -> pd.DataFrame:
+    """
+    Fetch GICS sector/industry fields for a list of RICs in batches.
+    Returns a DataFrame with a RIC column.
+    """
+    n_batches = math.ceil(len(rics) / GICS_BATCH_SIZE)
+    log.info("Fetching GICS data in %d batch(es) of %d...", n_batches, GICS_BATCH_SIZE)
+
+    gics_pages: List[pd.DataFrame] = []
+
+    for i in range(n_batches):
+        batch = rics[i * GICS_BATCH_SIZE : (i + 1) * GICS_BATCH_SIZE]
+
+        for attempt in range(1, MAX_API_RETRIES + 1):
+            try:
+                result = rd.get_data(universe=batch, fields=GICS_FIELDS)
+                gics_pages.append(result)
+                log.info("GICS batch %d/%d done (%d RICs).", i + 1, n_batches, len(batch))
+                break
+            except Exception as exc:
+                log.warning("GICS batch %d attempt %d failed: %s", i + 1, attempt, exc)
+                if attempt == MAX_API_RETRIES:
+                    log.error("Giving up on GICS batch %d – skipping.", i + 1)
+                    break
+                time.sleep(RETRY_SLEEP_SEC)
+
+    if not gics_pages:
+        log.warning("No GICS data returned – sector/industry will be NULL.")
+        return pd.DataFrame(columns=["RIC"] + GICS_FIELDS)
+
+    gics_df = pd.concat(gics_pages, ignore_index=True)
+    gics_df = gics_df.rename(columns={"Instrument": "RIC"})  # rd.get_data uses "Instrument"
+    return gics_df
+
+
+# ===========================================================================
+# Step 3 – Merge and clean
+# ===========================================================================
+
+
+def _clean(val) -> Optional[str]:
+    """Return None for blank/null/NaN values, stripped string otherwise."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    return None if s in ("", "nan", "None", "<NA>") else s
+
+
+def build_master_and_xref(
+    universe_df: pd.DataFrame,
+    gics_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Merge search results with GICS fields and split into the two target DataFrames:
+
+        master_df – columns matching dbo.security_master (no security_id yet)
+        xref_df   – columns matching dbo.security_vendor_xref (no security_id yet)
+
+    Internal join-key columns are prefixed with '_' and stripped before any DB write.
+    """
+    now_str     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    script_name = "refinitiv_ingest.py"
+
+    merged = universe_df.merge(gics_df, on="RIC", how="left")
+
+    master_df = pd.DataFrame({
+        "name":           merged["IssuerCommonName"].map(_clean),
+        "isin":           merged["ISIN"].map(_clean),
+        "sedol":          merged["SEDOL"].map(_clean),
+        "cusip":          merged["CUSIP"].map(_clean),
+        "figi":           None,                                     # not in Refinitiv search
+        "country":        merged["RCSExchangeCountryLeaf"].map(_clean),
+        "currency":       merged["RCSCurrencyLeaf"].map(_clean),
+        "sector":         merged["GICS Sector Name"].map(_clean),
+        "industry_group": merged["GICS Industry Name"].map(_clean),
+        "industry":       merged["GICS Sub-Industry Name"].map(_clean),
+        "security_type":  merged["RCSAssetCategoryLeaf"].map(_clean),
+        "asset_class":    merged["RCSAssetClass"].map(_clean),
+        "is_active":      1,
+        "upsert_date":    now_str,
+        "upsert_by":      script_name,
+        "_ric":           merged["RIC"],                            # internal join key
+        "_isin":          merged["ISIN"].map(_clean),
+        "_cusip":         merged["CUSIP"].map(_clean),
+    })
+
+    xref_df = pd.DataFrame({
+        "vendor":               VENDOR,
+        "vendor_ticker":        merged["RIC"].map(_clean),          # RIC is Refinitiv's instrument code
+        "vendor_exchange_code": merged["ExchangeCode"].map(_clean),
+        "vendor_currency":      merged["RCSCurrencyLeaf"].map(_clean),
+        "loanxid":              None,                               # Aladdin-specific, not applicable here
+        "is_primary":           0,
+        "is_active":            1,
+        "upsert_date":          now_str,
+        "upsert_by":            script_name,
+        "_ric":                 merged["RIC"],                      # internal join key
+        "_isin":                merged["ISIN"].map(_clean),
+        "_cusip":               merged["CUSIP"].map(_clean),
+    })
+
+    return master_df, xref_df
+
+
+# ===========================================================================
+# Step 4 – Upsert security_master and resolve security_ids
+# ===========================================================================
+
+
+def upsert_security_master(
+    master_df: pd.DataFrame,
+    orm_session: Session,
+    orm_engine: sql.Engine,
+) -> pd.DataFrame:
+    """
+    For each incoming security, find an existing security_id by matching
+    ISIN → CUSIP → FIGI (in priority order).
+
+    - Matched  : keep existing security_id.
+    - Unmatched : insert new row; reload the table to capture the generated id.
+
+    Returns master_df with a populated `security_id` column.
+    """
+    log.info("Loading existing security_master from DB...")
+    existing = database.read_security_master(orm_session, orm_engine)
+
+    isin_map  = {v: k for k, v in existing.set_index("security_id")["isin"].dropna().items()}
+    cusip_map = {v: k for k, v in existing.set_index("security_id")["cusip"].dropna().items()}
+    figi_map  = {v: k for k, v in existing.set_index("security_id")["figi"].dropna().items()}
+
+    to_insert:    List[dict]          = []
+    security_ids: List[Optional[int]] = []
+
+    for _, row in master_df.iterrows():
+        sid = (
+            isin_map.get(row["isin"])
+            or cusip_map.get(row["cusip"])
+            or figi_map.get(row["figi"])
+        )
+        security_ids.append(sid)
+        if sid is None:
+            to_insert.append({
+                k: v for k, v in row.items()
+                if not k.startswith("_")  # strip internal join-key columns
+            })
+
+    master_df = master_df.copy()
+    master_df["security_id"] = security_ids
+
+    if to_insert:
+        log.info("Inserting %d new securities into security_master...", len(to_insert))
+        for i in range(0, len(to_insert), DB_BATCH_SIZE):
+            batch       = to_insert[i : i + DB_BATCH_SIZE]
+            new_session = Session(orm_engine)
+            database._execute_with_session(
+                new_session,
+                lambda data: new_session.bulk_insert_mappings(database.SecurityMaster, data),  # type: ignore
+                batch,
+            )
+            log.info("  Inserted batch %d–%d.", i + 1, i + len(batch))
+
+        # Reload to pick up DB-generated security_ids for newly inserted rows
+        log.info("Reloading security_master to resolve new security_ids...")
+        existing  = database.read_security_master(orm_session, orm_engine)
+        isin_map  = {v: k for k, v in existing.set_index("security_id")["isin"].dropna().items()}
+        cusip_map = {v: k for k, v in existing.set_index("security_id")["cusip"].dropna().items()}
+        figi_map  = {v: k for k, v in existing.set_index("security_id")["figi"].dropna().items()}
+
+        for idx, row in master_df.iterrows():
+            if pd.isna(master_df.at[idx, "security_id"]):
+                master_df.at[idx, "security_id"] = (
+                    isin_map.get(row["_isin"])
+                    or cusip_map.get(row["_cusip"])
+                )
+    else:
+        log.info("All %d securities already exist in security_master.", len(master_df))
+
+    missing = master_df["security_id"].isna().sum()
+    if missing:
+        log.warning("%d rows could not be resolved to a security_id and will be skipped.", missing)
+
+    master_df = master_df.dropna(subset=["security_id"])
+    master_df["security_id"] = master_df["security_id"].astype(int)
+    return master_df
+
+
+# ===========================================================================
+# Step 5 – Attach resolved security_ids to xref and write
+# ===========================================================================
+
+
+def upsert_vendor_xref(
+    master_df: pd.DataFrame,
+    xref_df: pd.DataFrame,
+    orm_engine: sql.Engine,
+) -> None:
+    """
+    Join the resolved security_ids from master_df into xref_df (keyed on _ric),
+    then batch-upsert into security_vendor_xref via db.write_security_vendor_xref.
+    """
+    id_map  = master_df.set_index("_ric")["security_id"].to_dict()
+    xref_df = xref_df.copy()
+    xref_df["security_id"] = xref_df["_ric"].map(id_map)
+    xref_df = xref_df.dropna(subset=["security_id"])
+    xref_df["security_id"] = xref_df["security_id"].astype(int)
+
+    # Strip internal join-key columns before writing
+    xref_clean = xref_df.drop(columns=[c for c in xref_df.columns if c.startswith("_")])
+
+    log.info("Writing %d vendor xref rows...", len(xref_clean))
+    for i in range(0, len(xref_clean), DB_BATCH_SIZE):
+        batch_df     = xref_clean.iloc[i : i + DB_BATCH_SIZE]
+        xref_session = Session(orm_engine)
+        database.write_security_vendor_xref(batch_df, xref_session, vendor=VENDOR)
+        log.info("  Xref batch %d–%d written.", i + 1, i + len(batch_df))
+
+
+# ===========================================================================
+# Main
+# ===========================================================================
+
+
+def main() -> None:
+    log.info("=" * 60)
+    log.info("Refinitiv Security Master Ingestion – START")
+    log.info("=" * 60)
+
+    # --- Open Refinitiv session ---
+    rd.open_session()
+    log.info("Refinitiv session opened.")
+
+    try:
+        universe_df        = fetch_refinitiv_universe()
+        rics               = universe_df["RIC"].dropna().unique().tolist()
+        gics_df            = fetch_gics_data(rics)
+        master_df, xref_df = build_master_and_xref(universe_df, gics_df)
+        log.info("Built %d candidate master rows and %d xref rows.", len(master_df), len(xref_df))
+    finally:
+        rd.close_session()
+        log.info("Refinitiv session closed.")
+
+    # --- Open DB connection ---
+    orm_engine, orm_conn, _, orm_session = database.get_db_connection()
+
+    try:
+        master_df = upsert_security_master(master_df, orm_session, orm_engine)
+        log.info("security_master upsert complete. Resolved %d security_ids.", len(master_df))
+
+        upsert_vendor_xref(master_df, xref_df, orm_engine)
+        log.info("security_vendor_xref upsert complete.")
+    finally:
+        orm_conn.close()
+        log.info("DB connection closed.")
+
+    log.info("=" * 60)
+    log.info("Refinitiv Security Master Ingestion – DONE")
+    log.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
