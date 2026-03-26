@@ -2,10 +2,15 @@
 Refinitiv Security Master Ingestion
 =====================================
 Fetches the full equity universe from Refinitiv Data Library, enriches it with
-GICS sector/industry data, then upserts into the two-table security master:
+GICS sector/industry data and additional identifiers, then upserts into the
+two-table security master:
 
-    dbo.security_master      – one row per canonical security (de-duplicated on ISIN/CUSIP/FIGI)
+    dbo.security_master      – one row per canonical security
     dbo.security_vendor_xref – one row per vendor × security  (Refinitiv-specific codes)
+
+Matching cascade (highest → lowest priority):
+    ISIN → CUSIP → FIGI → SEDOL → VALOR → WKN → Common Code
+    → PermID → Ticker+Exchange → Name+Country
 
 Usage:
     python refinitiv_ingest.py
@@ -76,6 +81,16 @@ GICS_FIELDS = [
     "TR.GICSSubIndustry",
 ]
 
+# Extra identifiers fetched alongside GICS to widen the matching cascade
+EXTRA_ID_FIELDS = [
+    "TR.VALOR",          # Swiss Valorennummer
+    "TR.WKN",            # German Wertpapierkennnummer
+    "TR.CommonCode",     # Euroclear / Clearstream Common Code
+    "TR.PermID",         # Refinitiv permanent identifier (open, non-recycled)
+]
+
+ENRICH_FIELDS = GICS_FIELDS + EXTRA_ID_FIELDS
+
 # ===========================================================================
 # Step 1 – Fetch universe from Refinitiv (paginated)
 # ===========================================================================
@@ -141,39 +156,40 @@ def fetch_refinitiv_universe() -> pd.DataFrame:
 # ===========================================================================
 
 
-def fetch_gics_data(rics: List[str]) -> pd.DataFrame:
+def fetch_enrichment_data(rics: List[str]) -> pd.DataFrame:
     """
-    Fetch GICS sector/industry fields for a list of RICs in batches.
+    Fetch GICS sector/industry fields **and** extra identifiers
+    (VALOR, WKN, Common Code, PermID) for a list of RICs in batches.
     Returns a DataFrame with a RIC column.
     """
     n_batches = math.ceil(len(rics) / GICS_BATCH_SIZE)
-    log.info("Fetching GICS data in %d batch(es) of %d...", n_batches, GICS_BATCH_SIZE)
+    log.info("Fetching enrichment data in %d batch(es) of %d...", n_batches, GICS_BATCH_SIZE)
 
-    gics_pages: List[pd.DataFrame] = []
+    pages: List[pd.DataFrame] = []
 
     for i in range(n_batches):
         batch = rics[i * GICS_BATCH_SIZE : (i + 1) * GICS_BATCH_SIZE]
 
         for attempt in range(1, MAX_API_RETRIES + 1):
             try:
-                result = rd.get_data(universe=batch, fields=GICS_FIELDS)
-                gics_pages.append(result)
-                log.info("GICS batch %d/%d done (%d RICs).", i + 1, n_batches, len(batch))
+                result = rd.get_data(universe=batch, fields=ENRICH_FIELDS)
+                pages.append(result)
+                log.info("Enrichment batch %d/%d done (%d RICs).", i + 1, n_batches, len(batch))
                 break
             except Exception as exc:
-                log.warning("GICS batch %d attempt %d failed: %s", i + 1, attempt, exc)
+                log.warning("Enrichment batch %d attempt %d failed: %s", i + 1, attempt, exc)
                 if attempt == MAX_API_RETRIES:
-                    log.error("Giving up on GICS batch %d – skipping.", i + 1)
+                    log.error("Giving up on enrichment batch %d – skipping.", i + 1)
                     break
                 time.sleep(RETRY_SLEEP_SEC)
 
-    if not gics_pages:
-        log.warning("No GICS data returned – sector/industry will be NULL.")
-        return pd.DataFrame(columns=["RIC"] + GICS_FIELDS)
+    if not pages:
+        log.warning("No enrichment data returned – sector/industry & extra IDs will be NULL.")
+        return pd.DataFrame(columns=["RIC"] + ENRICH_FIELDS)
 
-    gics_df = pd.concat(gics_pages, ignore_index=True)
-    gics_df = gics_df.rename(columns={"Instrument": "RIC"})  # rd.get_data uses "Instrument"
-    return gics_df
+    enrich_df = pd.concat(pages, ignore_index=True)
+    enrich_df = enrich_df.rename(columns={"Instrument": "RIC"})  # rd.get_data uses "Instrument"
+    return enrich_df
 
 
 # ===========================================================================
@@ -191,10 +207,10 @@ def _clean(val) -> Optional[str]:
 
 def build_master_and_xref(
     universe_df: pd.DataFrame,
-    gics_df: pd.DataFrame,
+    enrich_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Merge search results with GICS fields and split into the two target DataFrames:
+    Merge search results with enrichment fields and split into the two target DataFrames:
 
         master_df – columns matching dbo.security_master (no security_id yet)
         xref_df   – columns matching dbo.security_vendor_xref (no security_id yet)
@@ -204,27 +220,49 @@ def build_master_and_xref(
     now_str     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     script_name = "refinitiv_ingest.py"
 
-    merged = universe_df.merge(gics_df, on="RIC", how="left")
+    merged = universe_df.merge(enrich_df, on="RIC", how="left")
+
+    # Helper: safely pull a column that may or may not exist in 'merged'
+    def _col(name: str) -> pd.Series:
+        if name in merged.columns:
+            return merged[name].map(_clean)
+        return pd.Series([None] * len(merged), dtype=object)
 
     master_df = pd.DataFrame({
-        "name":           merged["IssuerCommonName"].map(_clean),
-        "isin":           merged["ISIN"].map(_clean),
-        "sedol":          merged["SEDOL"].map(_clean),
-        "cusip":          merged["CUSIP"].map(_clean),
+        # --- core identifiers ---
+        "name":           _col("IssuerCommonName"),
+        "isin":           _col("ISIN"),
+        "sedol":          _col("SEDOL"),
+        "cusip":          _col("CUSIP"),
         "figi":           None,                                     # not in Refinitiv search
-        "country":        merged["RCSExchangeCountryLeaf"].map(_clean),
-        "currency":       merged["RCSCurrencyLeaf"].map(_clean),
-        "sector":         merged["GICS Sector Name"].map(_clean),
-        "industry_group": merged["GICS Industry Name"].map(_clean),
-        "industry":       merged["GICS Sub-Industry Name"].map(_clean),
-        "security_type":  merged["RCSAssetCategoryLeaf"].map(_clean),
-        "asset_class":    merged["RCSAssetClass"].map(_clean),
+        "valor":          _col("VALOR"),                            # Swiss Valorennummer
+        "wkn":            _col("WKN"),                              # German Wertpapierkennnummer
+        "common_code":    _col("Common Code"),                      # Euroclear / Clearstream
+        "perm_id":        _col("PermID"),                           # Refinitiv permanent ID
+        "ticker":         _col("TickerSymbol"),
+        "exchange_code":  _col("ExchangeCode"),
+        # --- descriptive ---
+        "country":        _col("RCSExchangeCountryLeaf"),
+        "currency":       _col("RCSCurrencyLeaf"),
+        "sector":         _col("GICS Sector Name"),
+        "industry_group": _col("GICS Industry Name"),
+        "industry":       _col("GICS Sub-Industry Name"),
+        "security_type":  _col("RCSAssetCategoryLeaf"),
+        "asset_class":    _col("RCSAssetClass"),
         "is_active":      1,
         "upsert_date":    now_str,
         "upsert_by":      script_name,
-        "_ric":           merged["RIC"],                            # internal join key
-        "_isin":          merged["ISIN"].map(_clean),
-        "_cusip":         merged["CUSIP"].map(_clean),
+        # --- internal join keys (stripped before DB write) ---
+        "_ric":           merged["RIC"],
+        "_isin":          _col("ISIN"),
+        "_cusip":         _col("CUSIP"),
+        "_sedol":         _col("SEDOL"),
+        "_valor":         _col("VALOR"),
+        "_wkn":           _col("WKN"),
+        "_common_code":   _col("Common Code"),
+        "_perm_id":       _col("PermID"),
+        "_ticker_exch":   (_col("TickerSymbol").fillna("") + "|" + _col("ExchangeCode").fillna("")),
+        "_name_country":  (_col("IssuerCommonName").fillna("") + "|" + _col("RCSExchangeCountryLeaf").fillna("")),
     })
 
     xref_df = pd.DataFrame({
@@ -250,14 +288,80 @@ def build_master_and_xref(
 # ===========================================================================
 
 
+def _build_lookup_maps(existing: pd.DataFrame) -> dict:
+    """
+    Build a dict of {identifier_type: {value: security_id}} from the
+    existing security_master table for fast cascade lookups.
+    """
+    def _simple_map(col: str) -> dict:
+        if col not in existing.columns:
+            return {}
+        return {v: k for k, v in existing.set_index("security_id")[col].dropna().items()}
+
+    maps = {
+        "isin":        _simple_map("isin"),
+        "cusip":       _simple_map("cusip"),
+        "figi":        _simple_map("figi"),
+        "sedol":       _simple_map("sedol"),
+        "valor":       _simple_map("valor"),
+        "wkn":         _simple_map("wkn"),
+        "common_code": _simple_map("common_code"),
+        "perm_id":     _simple_map("perm_id"),
+    }
+
+    # Composite keys
+    ticker_exch_map: dict = {}
+    name_country_map: dict = {}
+    for _, erow in existing.iterrows():
+        sid = erow["security_id"]
+        t = _clean(erow.get("ticker"))
+        e = _clean(erow.get("exchange_code"))
+        if t and e:
+            ticker_exch_map[f"{t}|{e}"] = sid
+        n = _clean(erow.get("name"))
+        c = _clean(erow.get("country"))
+        if n and c:
+            name_country_map[f"{n}|{c}"] = sid
+
+    maps["ticker_exch"]  = ticker_exch_map
+    maps["name_country"] = name_country_map
+    return maps
+
+
+def _cascade_lookup(row: pd.Series, maps: dict) -> Optional[int]:
+    """
+    Walk the identifier cascade for a single row and return the first
+    matching security_id, or None.
+
+    Priority (highest → lowest):
+      ISIN → CUSIP → FIGI → SEDOL → VALOR → WKN → Common Code
+      → PermID → Ticker+Exchange → Name+Country
+    """
+    return (
+        maps["isin"].get(row.get("isin") or row.get("_isin"))
+        or maps["cusip"].get(row.get("cusip") or row.get("_cusip"))
+        or maps["figi"].get(row.get("figi"))
+        or maps["sedol"].get(row.get("sedol") or row.get("_sedol"))
+        or maps["valor"].get(row.get("valor") or row.get("_valor"))
+        or maps["wkn"].get(row.get("wkn") or row.get("_wkn"))
+        or maps["common_code"].get(row.get("common_code") or row.get("_common_code"))
+        or maps["perm_id"].get(row.get("perm_id") or row.get("_perm_id"))
+        or maps["ticker_exch"].get(row.get("_ticker_exch"))
+        or maps["name_country"].get(row.get("_name_country"))
+    )
+
+
 def upsert_security_master(
     master_df: pd.DataFrame,
     orm_session: Session,
     orm_engine: sql.Engine,
 ) -> pd.DataFrame:
     """
-    For each incoming security, find an existing security_id by matching
-    ISIN → CUSIP → FIGI (in priority order).
+    For each incoming security, find an existing security_id by walking
+    the full identifier cascade:
+
+        ISIN → CUSIP → FIGI → SEDOL → VALOR → WKN → Common Code
+        → PermID → Ticker+Exchange → Name+Country
 
     - Matched  : keep existing security_id.
     - Unmatched : insert new row; reload the table to capture the generated id.
@@ -266,20 +370,13 @@ def upsert_security_master(
     """
     log.info("Loading existing security_master from DB...")
     existing = database.read_security_master(orm_session, orm_engine)
-
-    isin_map  = {v: k for k, v in existing.set_index("security_id")["isin"].dropna().items()}
-    cusip_map = {v: k for k, v in existing.set_index("security_id")["cusip"].dropna().items()}
-    figi_map  = {v: k for k, v in existing.set_index("security_id")["figi"].dropna().items()}
+    maps = _build_lookup_maps(existing)
 
     to_insert:    List[dict]          = []
     security_ids: List[Optional[int]] = []
 
     for _, row in master_df.iterrows():
-        sid = (
-            isin_map.get(row["isin"])
-            or cusip_map.get(row["cusip"])
-            or figi_map.get(row["figi"])
-        )
+        sid = _cascade_lookup(row, maps)
         security_ids.append(sid)
         if sid is None:
             to_insert.append({
@@ -304,17 +401,12 @@ def upsert_security_master(
 
         # Reload to pick up DB-generated security_ids for newly inserted rows
         log.info("Reloading security_master to resolve new security_ids...")
-        existing  = database.read_security_master(orm_session, orm_engine)
-        isin_map  = {v: k for k, v in existing.set_index("security_id")["isin"].dropna().items()}
-        cusip_map = {v: k for k, v in existing.set_index("security_id")["cusip"].dropna().items()}
-        figi_map  = {v: k for k, v in existing.set_index("security_id")["figi"].dropna().items()}
+        existing = database.read_security_master(orm_session, orm_engine)
+        maps = _build_lookup_maps(existing)
 
         for idx, row in master_df.iterrows():
             if pd.isna(master_df.at[idx, "security_id"]):
-                master_df.at[idx, "security_id"] = (
-                    isin_map.get(row["_isin"])
-                    or cusip_map.get(row["_cusip"])
-                )
+                master_df.at[idx, "security_id"] = _cascade_lookup(row, maps)
     else:
         log.info("All %d securities already exist in security_master.", len(master_df))
 
@@ -375,8 +467,8 @@ def main() -> None:
     try:
         universe_df        = fetch_refinitiv_universe()
         rics               = universe_df["RIC"].dropna().unique().tolist()
-        gics_df            = fetch_gics_data(rics)
-        master_df, xref_df = build_master_and_xref(universe_df, gics_df)
+        enrich_df          = fetch_enrichment_data(rics)
+        master_df, xref_df = build_master_and_xref(universe_df, enrich_df)
         log.info("Built %d candidate master rows and %d xref rows.", len(master_df), len(xref_df))
     finally:
         rd.close_session()
